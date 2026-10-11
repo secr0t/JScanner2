@@ -512,8 +512,22 @@ async def batch_execute_requests(
 
     safe_records = [r for r in vuln_records if r.get("id")]
 
-    if not safe_records:
-        return []
+    final_results = []
+    exec_records = []
+    for record in safe_records:
+        if _is_dangerous_write_url(record.get("full_url", "")):
+            logger.warning(f"🛑 [Batch Request] 命中黑名单，拦截请求: {record.get('full_url')}")
+            final_results.append({
+                "id": record["id"],
+                "status_code": -3,
+                "verdict": "blocked_by_blacklist",
+                "content_summary": "Blocked: URL matched dangerous blacklist"
+            })
+        else:
+            exec_records.append(record)
+
+    if not exec_records:
+        return final_results
 
     async def single_request(record: Dict[str, Any]) -> Dict[str, Any]:
         """单个请求的异步包装"""
@@ -528,15 +542,14 @@ async def batch_execute_requests(
         result["id"] = record["id"]
         return result
 
-    tasks = [single_request(record) for record in safe_records]
+    tasks = [single_request(record) for record in exec_records]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    final_results = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             logger.error(f"❌ [Batch Request] 任务 {i} 执行失败: {result}")
             final_results.append({
-                "id": safe_records[i]["id"],
+                "id": exec_records[i]["id"],
                 "status_code": -1,
                 "verdict": "failed",
                 "content_summary": f"Request Failed: {str(result)[:100]}"
