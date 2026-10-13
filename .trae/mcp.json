@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "jscanner2": {
+      "command": "D:\\Data\\Anaconda3\\python.exe",
+      "args": [
+        "-B",
+        "-m",
+        "agent.mcp_server"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "START_MCP_TIMEOUT_MS": "60000",
+        "RUN_MCP_TIMEOUT_MS": "120000"
+      }
+    }
+  }
+}

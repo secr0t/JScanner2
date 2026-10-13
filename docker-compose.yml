@@ -26,3 +26,30 @@ services:
       resources:
         limits:
           memory: 6G
+
+  # ─── Agent MCP Server（可选，按需启动）───
+  # 启动: docker compose run --rm agent
+  # HTTP 模式: docker compose run --rm agent python agent/mcp_server.py --transport http --port 9000
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jscanner2-agent
+    entrypoint: ["python"]
+    command: ["agent/mcp_server.py"]
+    volumes:
+      - ./config/config.py:/app/config/config.py
+      - ./config/models_config.json:/app/config/models_config.json
+      - ./config/scanner_rules.py:/app/config/scanner_rules.py
+      - ./config/whiteList.txt:/app/config/whiteList.txt
+      - ./config/nltk_data:/app/config/nltk_data
+      - ./Result:/app/Result
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
+      - JSCANNER_CONCURRENCY=1
+    network_mode: host
+    deploy:
+      resources:
+        limits:
+          memory: 6G
