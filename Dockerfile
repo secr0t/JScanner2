@@ -40,5 +40,10 @@ COPY . .
 # 创建必要目录
 RUN mkdir -p Result Overflow_Queue logs
 
+# 默认入口：留空，由 docker-compose / 命令行指定
 ENTRYPOINT []
 CMD []
+
+# Agent MCP Server 入口（可选）：
+# docker run jscanner2 python agent/mcp_server.py
+# docker run jscanner2 python agent/mcp_server.py --transport http --port 9000

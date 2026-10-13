@@ -40,6 +40,58 @@ docker compose run --rm scanner /app/run_scan.sh urls.txt
 
 ---
 
+## ⌨️ Command Line Options
+
+### Single-site scan (CLI)
+
+```bash
+python main.py -u https://target.com -H 2 -t 10 -fp -fs
+```
+
+### Batch scan (run_scan.sh)
+
+```bash
+bash run_scan.sh urls.txt          # pass the URL file as an argument
+echo urls.txt | bash run_scan.sh   # or pipe it via stdin
+```
+
+`run_scan.sh` includes: memory-safety resumable scanning (overflow queue), heartbeat watchdog with auto-restart on hang, and Feishu notifications.
+
+### Option reference
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-u`, `--url` | required | Target website URL (must include http/https) |
+| `-H`, `--height` | 2 | Scan depth |
+| `-t`, `--thread_num` | 10 | Concurrent thread count |
+| `-p`, `--proxy` | empty | Proxy, e.g. `http://127.0.0.1:7890` |
+| `-v`, `--visible` | False | Show the browser window (headless by default) |
+| `-fp`, `--findparam` | False | Auto-parse API parameters (recommended) |
+| `-fs`, `--fastscan` | False | Fast-scan mode: HTTP-probe filter before AI analysis (recommended) |
+| `-asir`, `--analyzeSensitiveInfoRex` | False | Collect sensitive info from JS with regex |
+| `-asia`, `--analyzeSensitiveInfoAI` | False | Analyze sensitive info with AI |
+| `-rv`, `--request-validation` | False | Auto-send validation requests after AI analysis |
+| `-nr`, `--no-request` | False | Store AI results only, skip validation requests |
+
+Recommended combination (matches `run_scan.sh` defaults):
+
+```bash
+python main.py -u https://target.com -H 5 -fp -fs -asia
+```
+
+### Configuration
+
+| File | Purpose |
+| --- | --- |
+| `config/config.py` | AI model endpoint, API keys, whitelist path, memory threshold, Feishu alerts, output paths |
+| `config/models_config.json` | Model list configuration |
+| `config/whiteList.txt` | Whitelisted domains (only whitelisted paths are scanned) |
+| `setup.sh` | One-time setup (API keys, NLTK data download) |
+
+> **Note**: AI features (`-fp` / `-asia`) require a valid API key in `config/config.py`. Scanning still runs without it, but AI features are unavailable.
+
+---
+
 ## 📖 Overview
 
 **JScanner2** is an intelligent JavaScript security scanning tool that combines **AST (Abstract Syntax Tree) parsing** with **AI large language models** to discover sensitive information and unauthorized access vulnerabilities in JavaScript files.
@@ -69,7 +121,22 @@ Traditional JavaScript scanning tools (findsomething, JSFinder, etc.) rely on **
 
 ## 📊 Results Analysis
 
-Scan results are stored as SQLite databases in the `Result/` directory.
+Scan results are stored as SQLite databases in the `Result/` directory (default: `Result/JScanner_Result.db`).
+
+| Table | Content |
+| --- | --- |
+| `scan_results` | Crawled URL base data |
+| `api_analysis_state` | API analysis state machine (DISCOVERED → AI_PENDING → AI_DONE → VALIDATED) |
+| `ai_vulns` | Vulnerability / unauthorized-access findings (risk: High / Med / Low / Info) |
+| `sensitive_info` | Sensitive info findings (risk level & type) |
+| `js_source_maps` | SourceMap exposure detection results |
+| `visited_urls` | Visited URLs (deduplication) |
+
+Query example:
+
+```bash
+python -c "import sqlite3; c=sqlite3.connect('Result/JScanner_Result.db'); [print(r) for r in c.execute('SELECT api_endpoint,http_method,risk_level FROM ai_vulns WHERE risk_level=\"High\"')]"
+```
 
 ## 📈 Real-World Results
 
@@ -124,6 +191,37 @@ google.com
 facebook.com
 analytics.example.com
 ```
+
+---
+
+## 🤖 Agent Usage Guide
+
+JScanner2 can be driven by AI agents (Trae / Claude / Cursor, etc.). The project ships an **MCP server** at `agent/mcp_server.py` (built on the official FastMCP SDK) that lets agents start scans, poll progress, and fetch results programmatically.
+
+### Start the MCP server
+
+```bash
+# stdio transport (default, for TraeCode / Claude Desktop / MCP clients)
+python agent/mcp_server.py
+
+# HTTP transport (streamable-http)
+python agent/mcp_server.py --transport http --port 9000
+```
+
+MCP tools: `jscanner_start_scan`, `jscanner_get_task`, `jscanner_list_tasks`, `jscanner_stop_task`, `jscanner_get_apis`, `jscanner_get_vulnerabilities`, `jscanner_get_sensitive_info`, `jscanner_get_sourcemaps`, `jscanner_get_task_logs`.
+
+### Agent workflow
+
+1. **Confirm authorization** — only scan targets the user explicitly authorizes.
+2. **Identify the target** — get a concrete URL (with http/https), decide scan depth and options.
+3. **Start the scan** — prefer `-fp -fs` (fast-scan + parameter parsing); add `-asia` / `-asir` when sensitive-info scanning is needed.
+4. **Collect results** — query `ai_vulns` (focus on High risk), `sensitive_info`, `js_source_maps`.
+
+### Operational notes
+
+- Deeper scans take longer and consume more AI tokens — keep the target scope tight.
+- Large sites can take hours; prefer `run_scan.sh` in the background for batch jobs.
+- If a Feishu webhook is configured, failures trigger alerts.
 
 ---
 
