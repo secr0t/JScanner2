@@ -1,8 +1,9 @@
+import difflib
 import hashlib
 import re
 import time
 import traceback
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Iterable, Optional, List, Tuple
 
 import json_repair
 
@@ -46,6 +47,19 @@ class AISecurityAuditor:
 
     # 代码最大长度阈值
     CODE_MAX_LENGTH = 12000
+
+    # ============================================================
+    # 参数结果复用缓存（精确层 + 模糊层）
+    # ============================================================
+
+    # 模糊层：相似度达到该阈值才允许复用（difflib ratio）
+    PARAM_CACHE_SIMILARITY_THRESHOLD = 0.97
+
+    # 模糊层：差异片段若触及这些「参数承载键」，说明参数定义可能不同，
+    # 宁可多调一次 LLM 也不复用（避免漏报）
+    PARAM_BEARER_KEYS = frozenset({
+        "data", "params", "body", "query", "payload",
+    })
 
     # ============================================================
     # 前端导航 / 路由语义
@@ -136,6 +150,18 @@ class AISecurityAuditor:
             capacity=500000,
             error_rate=0.001,
         )
+
+        # 参数结果复用缓存：key=剥离 api_path 后的规范化 wrapper → LLM 提取结果。
+        # 与 _no_param_bloom 的区别：key 去掉路径（同结构异路径可复用），
+        # 且 has_value=0/1 都缓存（进程内精确 dict，不落盘、无假阳性）。
+        self._param_cache: Dict[str, Dict[str, Any]] = {}
+
+        # Level 3 参数值复用缓存：
+        # key   = 剥离 api_path 后的规范化 wrapper
+        # value = 同一 wrapper 下按 callers / param_keys / 取值策略区分的条目列表。
+        # 与 Level 2 分开存放：值结果 schema 不同，且复用条件额外要求
+        # callers 精确一致（业务调用点可能携带真实传参值，不能模糊）。
+        self._value_cache: Dict[str, List[Dict[str, Any]]] = {}
 
         # 最近一次 scan_multiple_apis 的上下文召回结果，供主流程推进状态机使用
         self.last_context_found = {}
@@ -757,6 +783,289 @@ class AISecurityAuditor:
 
         return filtered
 
+    @staticmethod
+    def _normalize_cache_key(
+        raw_wrapper: str,
+        api_path: str,
+    ) -> str:
+        """
+        剥离 api_path 后的规范化 wrapper → 参数结果缓存 key。
+
+        空 wrapper 返回 ""，调用方须跳过（不参与缓存）。
+        只替换「引号包裹的完整路径」，避免 /a/b/c 这种前缀误伤；
+        拼接形式（"/a" + "/b"）剥不干净 → key 不同 → 自然 miss，安全回退原逻辑。
+        """
+
+        if not raw_wrapper:
+            return ""
+
+        code = raw_wrapper
+
+        for q in ('"', "'", "`"):
+            code = code.replace(
+                f"{q}{api_path}{q}",
+                '"__P__"',
+            )
+
+        return re.sub(
+            r"\s+",
+            " ",
+            code,
+        )
+
+    @staticmethod
+    def _find_similar_key(
+        candidate_key: str,
+        cached_keys: Iterable[str],
+    ) -> Optional[str]:
+        """
+        模糊层共用核心（Level 2 / Level 3）：
+        在 cached_keys 中找一个与 candidate_key 足够相似的 key，
+        且差异片段不触及参数承载键 → 返回该 key，否则返回 None。
+
+        设计要点：
+            1. 相似度只是「捞」候选，diff 承载键校验才是「判」是否安全；
+            2. 非空白差异落在参数承载键附近（±60 字符窗口）就放弃复用，
+               走 LLM（宁可多花一次调用，不能漏报）；
+            3. 纯空白差异（空格/换行/缩进风格）不影响参数，直接跳过；
+            4. 取最相似的一条；多条同样相似时按缓存插入序取第一条。
+        """
+
+        if not candidate_key:
+            return None
+
+        best_key = None
+        best_ratio = 0.0
+
+        for cached_key in cached_keys:
+            ratio = difflib.SequenceMatcher(
+                None,
+                candidate_key,
+                cached_key,
+            ).ratio()
+
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_key = cached_key
+
+        if (
+            best_key is None
+            or best_ratio
+            < AISecurityAuditor.PARAM_CACHE_SIMILARITY_THRESHOLD
+        ):
+            return None
+
+        # 差异片段校验：列出两侧不匹配的文本块，
+        # 非空白差异若落在参数承载键附近（±60 字符窗口），则放弃复用。
+        # 理由：params/data/body 等承载键通常紧邻其参数对象，
+        # 在窗口内出现说明差异可能改写了参数名/值 → 不能复用。
+        matcher = difflib.SequenceMatcher(
+            None,
+            candidate_key,
+            best_key,
+        )
+
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+
+            cand_diff = candidate_key[i1:i2]
+            cached_diff = best_key[j1:j2]
+
+            # 纯空白差异（空格/换行/缩进风格）不影响参数，跳过
+            if (
+                cand_diff.strip() == ""
+                and cached_diff.strip() == ""
+            ):
+                continue
+
+            window = (
+                candidate_key[max(0, i1 - 60):i2 + 60]
+                + best_key[max(0, j1 - 60):j2 + 60]
+            )
+
+            if any(
+                key in window
+                for key in AISecurityAuditor.PARAM_BEARER_KEYS
+            ):
+                return None
+
+        logger.info(
+            f"[FuzzyCache] ratio={best_ratio:.3f}，"
+            f"差异片段未触及参数承载键，允许复用"
+        )
+
+        return best_key
+
+    def _find_similar_cache_match(
+        self,
+        candidate_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Level 2 模糊层：返回通过校验的缓存结果。
+        相似度 + 承载键护栏逻辑见共用方法 _find_similar_key。
+
+        返回:
+            命中 → 缓存的结果 dict {has_value, param_keys}
+            未命中 → None
+        """
+
+        best_key = self._find_similar_key(
+            candidate_key,
+            self._param_cache.keys(),
+        )
+
+        if best_key is None:
+            return None
+
+        return self._param_cache[best_key]
+
+    # ============================================================
+    # Level 3 参数值复用缓存
+    # ============================================================
+
+    def _normalize_callers(
+        self,
+        caller_codes: List[str],
+        api_path: str,
+    ) -> str:
+        """
+        规范化业务调用点（已过滤，≤3 个）：
+        逐个剥离 api_path + 折叠空白，用单元分隔符拼接。
+
+        callers 是真实调用点，可能携带真实传参值，
+        因此在 Level 3 值缓存里只允许精确一致，不做模糊。
+        """
+
+        if not caller_codes:
+            return ""
+
+        parts = []
+
+        for code in caller_codes[:3]:
+            if not isinstance(code, str):
+                code = str(code)
+
+            parts.append(
+                self._normalize_cache_key(code, api_path)
+            )
+
+        return "\x1f".join(parts)
+
+    @staticmethod
+    def _match_value_entry(
+        entries: List[Dict[str, Any]],
+        callers_key: str,
+        param_keys: Tuple[str, ...],
+        value_mode: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        在同一 wrapper 的条目列表里，
+        找 callers / param_keys / 取值策略全等的一条。
+        """
+
+        for entry in entries:
+            if (
+                entry["callers_key"] == callers_key
+                and tuple(entry["param_keys"]) == param_keys
+                and entry["value_mode"] == value_mode
+            ):
+                return entry["result"]
+
+        return None
+
+    def _lookup_value_cache(
+        self,
+        wrapper_norm: str,
+        callers_key: str,
+        param_keys: Tuple[str, ...],
+        value_mode: bool,
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """
+        Level 3 两层查找。
+
+        精确层：wrapper 归一化串等值；
+        模糊层：wrapper 相似度达标且差异不触承载键。
+        两层都要求 callers / param_keys / 取值策略精确一致。
+
+        返回:
+            ("exact" | "fuzzy", result)；未命中返回 (None, None)。
+        """
+
+        if not wrapper_norm:
+            return None, None
+
+        # ---- 精确层 ----
+        entries = self._value_cache.get(wrapper_norm)
+
+        if entries:
+            result = self._match_value_entry(
+                entries,
+                callers_key,
+                param_keys,
+                value_mode,
+            )
+
+            if result is not None:
+                return "exact", result
+
+        # ---- 模糊层（只模糊 wrapper，其余条件仍须精确）----
+        best_key = self._find_similar_key(
+            wrapper_norm,
+            self._value_cache.keys(),
+        )
+
+        if best_key is not None:
+            result = self._match_value_entry(
+                self._value_cache[best_key],
+                callers_key,
+                param_keys,
+                value_mode,
+            )
+
+            if result is not None:
+                return "fuzzy", result
+
+        return None, None
+
+    def _store_value_cache(
+        self,
+        wrapper_norm: str,
+        callers_key: str,
+        param_keys: Tuple[str, ...],
+        value_mode: bool,
+        result: Dict[str, Any],
+    ) -> None:
+        """
+        写回 Level 3 值缓存（result 不含 path，path 命中时各自回填）。
+        等价条目已存在则跳过。
+        """
+
+        if not wrapper_norm:
+            return
+
+        entries = self._value_cache.setdefault(
+            wrapper_norm,
+            [],
+        )
+
+        for entry in entries:
+            if (
+                entry["callers_key"] == callers_key
+                and tuple(entry["param_keys"]) == param_keys
+                and entry["value_mode"] == value_mode
+            ):
+                return
+
+        entries.append(
+            {
+                "callers_key": callers_key,
+                "param_keys": tuple(param_keys),
+                "value_mode": value_mode,
+                "result": result,
+            }
+        )
+
     # ============================================================
     # Level 2
     # ============================================================
@@ -915,6 +1224,50 @@ class AISecurityAuditor:
                 )
 
             # ----------------------------------------------------
+            # Layer 4: 参数结果复用缓存
+            # 同结构异路径的 wrapper（剥离 api_path 后逐字节等价）
+            # 参数提取结果必然一致，直接复用，跳过压缩 + LLM
+            # ----------------------------------------------------
+
+            cache_key = self._normalize_cache_key(
+                raw_wrapper,
+                api_path,
+            )
+
+            cached_result = None
+
+            # ---- 精确层：剥离路径后逐字节等价 ----
+            if cache_key and cache_key in self._param_cache:
+                cached_result = self._param_cache[cache_key]
+
+                logger.info(
+                    f"[{api_path}] ♻️ "
+                    f"参数结果缓存命中，复用 LLM 结果（跳过调用）"
+                )
+
+            # ---- 模糊层：相似度足够高 + 差异不触承载键 ----
+            elif cache_key:
+                fuzzy = self._find_similar_cache_match(
+                    cache_key
+                )
+
+                if fuzzy is not None:
+                    cached_result = fuzzy
+
+                    logger.info(
+                        f"[{api_path}] ♻️ "
+                        f"参数结果缓存模糊命中，复用 LLM 结果（跳过调用）"
+                    )
+
+            if cached_result is not None:
+                strategy_results[api_path] = {
+                    "decision": cached_result["has_value"],
+                    "param_keys": cached_result["param_keys"],
+                }
+
+                continue
+
+            # ----------------------------------------------------
             # 压缩代码
             # ----------------------------------------------------
 
@@ -982,6 +1335,17 @@ class AISecurityAuditor:
                         "param_keys"
                     ],
                 }
+
+                # 写回缓存（has_value=0/1 都写，复用无参数结论可省掉 Bloom 依赖）
+                if cache_key:
+                    self._param_cache[cache_key] = {
+                        "has_value": level2_result[
+                            "has_value"
+                        ],
+                        "param_keys": level2_result[
+                            "param_keys"
+                        ],
+                    }
 
                 # AI 返回无参数
                 if (
@@ -1070,6 +1434,57 @@ class AISecurityAuditor:
             )
 
             context_data["caller_codes"] = caller_codes
+
+            # ----------------------------------------------------
+            # Level 3 参数值复用缓存
+            # 同结构异路径 wrapper（剥路径后等价/高度相似）
+            # 且 callers / param_keys / 取值策略一致
+            # → 参数值结果必然一致，跳过压缩 + LLM。
+            # 查询异常时 fail-open 回退正常 LLM 流程。
+            # ----------------------------------------------------
+
+            wrapper_norm = ""
+            callers_key = ""
+
+            try:
+                wrapper_norm = self._normalize_cache_key(
+                    raw_wrapper,
+                    api_url,
+                )
+
+                callers_key = self._normalize_callers(
+                    caller_codes,
+                    api_url,
+                )
+
+                (
+                    hit_type,
+                    cached_value,
+                ) = self._lookup_value_cache(
+                    wrapper_norm,
+                    callers_key,
+                    tuple(param_keys or ()),
+                    self.request_validation,
+                )
+
+                if hit_type is not None:
+                    reused_value = dict(cached_value)
+                    reused_value["path"] = api_url
+
+                    logger.info(
+                        f"[{api_url}] ♻️ "
+                        f"Level 3 参数值缓存"
+                        f"{'模糊' if hit_type == 'fuzzy' else ''}"
+                        f"命中，跳过压缩与 LLM"
+                    )
+
+                    return reused_value
+
+            except Exception as cache_err:
+                logger.warning(
+                    f"[{api_url}] Level 3 值缓存查询异常，"
+                    f"回退 LLM：{cache_err}"
+                )
 
             wrapper_code = self._compress_code_loop(
                 raw_wrapper,
@@ -1214,6 +1629,19 @@ class AISecurityAuditor:
                 f"  └─ callers END ─┘\n"
                 f"  AI原始返回: {result}\n"
                 f"  最终解析: {parsed}"
+            )
+
+            # 写回 Level 3 值缓存（path 不缓存，命中时各自回填）
+            self._store_value_cache(
+                wrapper_norm,
+                callers_key,
+                tuple(param_keys or ()),
+                self.request_validation,
+                {
+                    key: value
+                    for key, value in parsed.items()
+                    if key != "path"
+                },
             )
 
             return parsed
