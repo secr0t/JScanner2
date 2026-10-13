@@ -1,10 +1,10 @@
 # ===== 此文件由 setup.sh 自动生成，如需自定义请直接编辑此文件 =====
 
 # 本地/私有化大模型服务地址
-BASE_URL = "http://124.221.245.69:3000/v1/"
+BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # API Key（请替换为您自己的密钥）
-API_KEY = "sk-SS0tGfXLwMortarsvHeQm96nMoEzTakR913moyh4GcCXu6AP"
+API_KEY = "sk-ws-H.EXLEYXX.cBc8."
 
 # 🔧 提示词缓存配置（阿里云 DashScope）
 ENABLE_PROMPT_CACHE = True  # 是否启用提示词缓存
@@ -26,7 +26,7 @@ proxies = {
 # ------------------------------
 # 🔔 飞书告警通知
 # ------------------------------
-FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/1412ed79-59f8-4e29-adb9-01a696ea0490"
+FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/1412ed79--4e29-adb9-"
 FEISHU_ALERT_LEVELS = ["ERROR", "CRITICAL"]       # 触发告警的日志级别
 FEISHU_RATE_LIMIT_SECONDS = 60                    # 相同告警内容60秒内只发一次
 

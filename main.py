@@ -20,6 +20,7 @@ from crawler.httpx_crawler import fetch_urls_with_dedup, fetch_urls_async
 from crawler.response_process import process_scan_result
 from infra.ai_client import client
 from infra.dedup import DuplicateChecker
+from infra import watchdog
 from infra.feishu import send_feishu_notify
 from parse_args import parse_args
 from processor.analysis import AISecurityAuditor
@@ -28,6 +29,7 @@ from processor.analysis.secret.js_sensitive_rex import find_all_info_by_rex
 from processor.analysis.secret.secret_scanner import SensitiveInfoScanner, cleanup_bloom_filters, remove_html_tags, \
     SQLiteStorage
 from processor.analysis.api.request_executor import batch_execute_requests
+from storage.api_state import ApiStatus
 from storage.filerw import read
 
 warnings.filterwarnings("ignore")
@@ -113,13 +115,20 @@ class Scanner:
         self.whiteList = read(WHITE_SCOPE_PATH)
         self.domain_base_urls = {}
 
+        # 站点维度 scan_id（P0-1：API 状态按站点隔离）与本次运行 run_id（P0-2：中断恢复）
+        self.scan_id = None
+        self.run_id = uuid.uuid4().hex
+
         self.ai_auditor = None
         if self.args.findparam:
             try:
                 self.ai_auditor = AISecurityAuditor(request_validation=self.args.request_validation)
             except Exception as e:
+                # P0-3：初始化失败必须打出完整栈，不能只留一句话后静默关闭 AI 分析
+                import traceback
+                traceback.print_exc()
+                logger.error(f"[AI] AI 安全审计器初始化失败（本次扫描不会产出 API 分析结果）：{e}")
                 print(f"[AI] AI 安全审计器初始化失败：{e}")
-                self.ai_auditor = None
 
         self.sensitive_scanner = None
         if self.args.analyzeSensitiveInfoAI:
@@ -131,8 +140,10 @@ class Scanner:
                     max_llm=80
                 )
             except Exception as e:
+                import traceback
+                traceback.print_exc()
+                logger.error(f"[Scanner] 敏感信息扫描器初始化失败：{e}")
                 print(f"[Scanner] 敏感信息扫描器初始化失败：{e}")
-                self.sensitive_scanner = None
 
         atexit.register(self._cleanup_resources)
 
@@ -179,8 +190,22 @@ class Scanner:
     async def run(self):
         """主运行逻辑"""
         os.makedirs("Result", exist_ok=True)
+        watchdog.beat("startup", self.args.url)
+        watchdog.start()                       # 启动心跳广播（daemon 线程）
         self.initial_urls = self._load_initial_urls()
-        self.checker = DuplicateChecker(db_handler=self.db_handler, initial_root_domain=self.initial_urls)
+
+        # P0-1：以站点为单位分配 scan_id，不同站点的 API 状态互不影响
+        root_domain = get_root_domain(self.args.url) if self.args.url else "unknown"
+        self.scan_id = self.db_handler.get_or_create_scan_id(root_domain)
+        print(f"🎯 [Scan] scan_id={self.scan_id} | 站点={root_domain} | run_id={self.run_id}")
+
+        # P0-2：把上一轮没跑完的 API 重新排队，支持从中断位置恢复
+        resumed = self.db_handler.reset_stale_in_progress(self.scan_id, self.run_id)
+        if resumed:
+            print(f"♻️ [Resume] {resumed} 个 API 从中断位置重新排队")
+
+        self.checker = DuplicateChecker(db_handler=self.db_handler, initial_root_domain=self.initial_urls,
+                                        scan_id=self.scan_id)
         self.args.initial_urls = self.initial_urls
 
         raw_seed_urls = self.load_url()
@@ -200,6 +225,7 @@ class Scanner:
 
         start_time = time.time()
         await self._scan_recursive(scan_seed_urls, 0, is_seed=True)
+        watchdog.beat("finished")
         print(f"🏁 任务结束 | 总耗时：{time.time() - start_time:.2f}秒")
 
     def load_url(self):
@@ -316,7 +342,10 @@ class Scanner:
         processed_count = 0
         skipped_dup_count = 0
 
-        all_unique_apis = {}
+        # (api_path, js_url) 全量保留：
+        # 不同 JS 文件里的同名路径上下文可能不同，不能在分析前按 path 丢掉
+        api_pairs = []
+        seen_pairs = set()
 
         for item in batch_all_next_paths_with_source:
             js_url = item.get("sourceURL")
@@ -337,15 +366,18 @@ class Scanner:
                 if self._is_api_path_blacklisted(api_path):
                     continue
 
-                if api_path not in all_unique_apis:
-                    all_unique_apis[api_path] = js_url
+                pair = (api_path, js_url)
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    api_pairs.append(pair)
 
-        apis_to_scan = []
-        for api_path, js_url in all_unique_apis.items():
-            if self.checker.is_api_path_processed(api_path):
-                skipped_dup_count += 1
-            else:
-                apis_to_scan.append((api_path, js_url))
+        # 去重范围 = (scan_id, api_path)；去重判据 = 状态机
+        all_paths_in_batch = list(dict.fromkeys(p for p, _ in api_pairs))
+        analyzable_paths = [p for p in all_paths_in_batch if self.checker.should_analyze_api(p)]
+        analyzable_set = set(analyzable_paths)
+        skipped_dup_count = len(all_paths_in_batch) - len(analyzable_paths)
+
+        apis_to_scan = [(api_path, js_url) for api_path, js_url in api_pairs if api_path in analyzable_set]
 
         if skipped_dup_count > 0:
             print(f"⏭️ [Path Dedup] Skipped {skipped_dup_count} duplicate API paths in this batch")
@@ -354,9 +386,9 @@ class Scanner:
             print(f"✅ [Batch] All APIs already processed, skipping AI analysis...")
             return
 
-        mark_data = [(api_path, js_url) for api_path, js_url in apis_to_scan]
-        self.checker.mark_api_paths_processed_batch(mark_data)
-        print(f"✅ [Dedup] Marked {len(apis_to_scan)} API paths as processed BEFORE analysis")
+        # P0-2：分析前只登记"发现"，不标记完成；后续失败仍会重新进入分析
+        self.checker.mark_apis_discovered([(api_path, js_url) for api_path, js_url in apis_to_scan])
+        print(f"📝 [State] Marked {len(analyzable_paths)} API paths as DISCOVERED (分析完成前不算 processed)")
 
         js_groups = {}
         for api_path, js_url in apis_to_scan:
@@ -388,6 +420,13 @@ class Scanner:
                 continue
 
             api_paths = [item[0] for item in api_data_list]
+            print(f"🧩 [AI] 开始分析 {js_url} | API 数: {len(api_paths)} | JS 大小: {len(js_source)} 字符")
+
+            # 进入 AI 前推进状态并累加尝试次数
+            self.checker.mark_api_status_batch(
+                api_paths, ApiStatus.AI_PENDING, js_url=js_url,
+                run_id=self.run_id, increment_attempt=True
+            )
 
             try:
                 batch_ai_advisories = self.ai_auditor.scan_multiple_apis(
@@ -395,34 +434,71 @@ class Scanner:
                     api_paths=api_paths,
                     target_url=effective_seed.strip() if effective_seed else self.args.url.strip()
                 )
-
-                for api_path, advisory_report in batch_ai_advisories.items():
-                    if not advisory_report:
-                        continue
-
-                    print(f"🤖 [AI Advisor] Generated Advisory for {api_path}")
-                    print(advisory_report)
-                    processed_count += 1
-
-                    full_url = next((item[1] for item in api_data_list if item[0] == api_path), "")
-
-                    record_id = self.db_handler.save_ai_result_with_id(
-                        js_url=js_url,
-                        full_url=full_url,
-                        advisory_report=advisory_report
-                    )
-
-                    if record_id:
-                        vuln_records_for_request.append({
-                            "id": record_id,
-                            "full_url": full_url,
-                            "http_method": advisory_report.get("method", ""),
-                            "params": advisory_report.get("params", ""),
-                            "path": advisory_report.get("path", "")
-                        })
             except Exception as e:
                 print_exc()
                 logger.error(f"❌ [AI] Failed to analyze APIs from {js_url}: {e}")
+                self.checker.mark_api_status_batch(
+                    api_paths, ApiStatus.AI_FAILED, js_url=js_url,
+                    last_error=str(e), run_id=self.run_id
+                )
+                continue
+
+            # 上下文召回结果（用于区分"没上下文"和"AI 失败"）
+            context_types = getattr(self.ai_auditor, "last_context_types", {}) or {}
+            context_found = getattr(self.ai_auditor, "last_context_found", {}) or {}
+
+            for api_path in api_paths:
+                advisory_report = batch_ai_advisories.get(api_path)
+
+                if not advisory_report:
+                    if not context_found.get(api_path, False):
+                        fail_status = ApiStatus.NO_CONTEXT
+                        reason = "AST 上下文未命中"
+                    elif context_types.get(api_path) == "FRONTEND_ROUTE":
+                        fail_status = ApiStatus.NO_CONTEXT
+                        reason = "前端路由上下文，非 HTTP API"
+                    else:
+                        fail_status = ApiStatus.AI_FAILED
+                        reason = "AI 未产出可用结果（超时/JSON 解析失败/空返回）"
+
+                    # 失败态不等于完成，下次扫描仍会重新处理
+                    self.checker.mark_api_status(
+                        api_path, fail_status, js_url=js_url,
+                        last_error=reason, run_id=self.run_id
+                    )
+                    continue
+
+                print(f"🤖 [AI Advisor] Generated Advisory for {api_path}")
+                print(advisory_report)
+                processed_count += 1
+
+                full_url = next((item[1] for item in api_data_list if item[0] == api_path), "")
+
+                record_id = self.db_handler.save_ai_result_with_id(
+                    js_url=js_url,
+                    full_url=full_url,
+                    advisory_report=advisory_report,
+                    scan_id=self.scan_id
+                )
+
+                if record_id:
+                    vuln_records_for_request.append({
+                        "id": record_id,
+                        "api_path": api_path,
+                        "full_url": full_url,
+                        "http_method": advisory_report.get("method", ""),
+                        "params": advisory_report.get("params", ""),
+                        "path": advisory_report.get("path", "")
+                    })
+                    self.checker.mark_api_status(
+                        api_path, ApiStatus.AI_DONE, js_url=js_url, run_id=self.run_id
+                    )
+                else:
+                    # 写库失败同样不能算完成
+                    self.checker.mark_api_status(
+                        api_path, ApiStatus.AI_FAILED, js_url=js_url,
+                        last_error="结果写入数据库失败", run_id=self.run_id
+                    )
 
         if processed_count > 0:
             print(f"🤖 [AI Advisor] Batch completed. Generated {processed_count} Advisories.")
@@ -430,6 +506,11 @@ class Scanner:
         if vuln_records_for_request:
             if not self.args.request_validation:
                 print(f"ℹ️  [Request Validation] 未开启请求验证，{len(vuln_records_for_request)} 条记录仅存档")
+                # 未开启验证：AI 阶段即为本轮终点，推进到终态
+                self.checker.mark_api_status_batch(
+                    [r["api_path"] for r in vuln_records_for_request],
+                    ApiStatus.VALIDATED, run_id=self.run_id
+                )
             else:
                 print(f"🏷️ [Classifier] Starting operation type classification for {len(vuln_records_for_request)} records...")
 
@@ -452,19 +533,55 @@ class Scanner:
                 if write_records:
                     self.db_handler.batch_mark_needs_manual_review([r["id"] for r in write_records])
                     print(f"📋 [Classifier] {len(write_records)} records marked as needs_manual_review")
+                    # 自动化链路到此结束，转入人工确认
+                    self.checker.mark_api_status_batch(
+                        [r["api_path"] for r in write_records],
+                        ApiStatus.VALIDATED, run_id=self.run_id
+                    )
 
                 if read_records:
                     print(f"🚀 [Request Validation] Starting {len(read_records)} READ requests...")
+                    self.checker.mark_api_status_batch(
+                        [r["api_path"] for r in read_records],
+                        ApiStatus.VALIDATION_PENDING, run_id=self.run_id
+                    )
                     try:
                         request_results = await batch_execute_requests(read_records)
 
                         updated_count = self.db_handler.batch_update_ai_vuln_request_results(request_results)
                         print(f"✅ [Request Validation] Completed. Updated {updated_count} records.")
 
+                        id_to_path = {r["id"]: r["api_path"] for r in read_records}
+                        validated_paths = []
+                        failed_paths = []
+                        for result in request_results:
+                            api_path = id_to_path.get(result.get("id"))
+                            if not api_path:
+                                continue
+                            if result.get("status_code", -1) > 0:
+                                validated_paths.append(api_path)
+                            else:
+                                failed_paths.append(api_path)
+
+                        if validated_paths:
+                            self.checker.mark_api_status_batch(
+                                validated_paths, ApiStatus.VALIDATED, run_id=self.run_id
+                            )
+                        if failed_paths:
+                            self.checker.mark_api_status_batch(
+                                failed_paths, ApiStatus.VALIDATION_FAILED,
+                                last_error="请求验证未拿到有效响应", run_id=self.run_id
+                            )
+
                     except Exception as e:
                         print_exc()
                         logger.error(f"❌ [Request Validation] Batch request failed: {e}")
                         print(f"❌ [Request Validation] 批量请求失败: {e}")
+                        self.checker.mark_api_status_batch(
+                            [r["api_path"] for r in read_records],
+                            ApiStatus.VALIDATION_FAILED,
+                            last_error=str(e), run_id=self.run_id
+                        )
                 else:
                     print(f"ℹ️  [Request Validation] No READ records to validate.")
         else:
@@ -667,6 +784,7 @@ class Scanner:
             batch_urls = urls_list[batch_idx:batch_idx + batch_size]
             current_batch = batch_idx // batch_size + 1
             print(f"\n[D{depth}] 批次 {current_batch}/{total_batches} (Size: {len(batch_urls)})")
+            watchdog.beat("batch", f"D{depth} 批次 {current_batch}/{total_batches}")
 
             try:
                 batch_result = await asyncio.wait_for(
@@ -689,18 +807,19 @@ class Scanner:
                         print(f"❌ [DB] 基础数据存储失败：{e}")
                 if self.args.findparam and self.ai_auditor:
                     print(f"🤖 [AI] 正在进行 API 逻辑审计...")
+                    watchdog.beat("ai_batch", f"D{depth} B{current_batch}")
                     await self._process_ai_batch(
                         batch_result["all_next_paths_with_source"],
                         batch_result["scan_info_list"],
                         batch_result["next_urls"]
                     )
             except Exception as e:
-                print(f"❌ [Fetch Error] 批次 {current_batch} 请求失败：{e}")
+                logger.error(f"❌ [Fetch Error] 批次 {current_batch}/{total_batches} 请求失败：{e}")
                 import traceback
                 traceback.print_exc()
                 continue
 
-            print(f"[D{depth}] 批次 {current_batch}/{total_batches} 扫描完成")
+            logger.info(f"[D{depth}] 批次 {current_batch}/{total_batches} 扫描完成")
             if current_batch < total_batches:
                 await asyncio.sleep(BATCH_SLEEP)
 
@@ -714,15 +833,16 @@ class Scanner:
             await self._extract_sensitive_info(all_scan_info_list)
 
         if all_next_urls:
-            print(f"➡️  进入深度 {depth + 1}")
+            logger.info(f"➡️  进入深度 {depth + 1} | 待扫描 URL：{len(all_next_urls)}")
             await self._scan_recursive(all_next_urls, depth + 1, is_seed=False)
         else:
-            print(f"✅ 深度 {depth} 完成")
+            logger.info(f"✅ 深度 {depth} 完成")
 
     async def _extract_sensitive_info(self, scan_info_list):
         source_map_results = []
         for scan_info in scan_info_list:
             url = scan_info["url"]
+            watchdog.beat("sensitive_loop", url)   # 逐文件推进都算进展
             if not (scan_info["is_valid"] == 1 or url in self.initial_urls):
                 continue
             if ".js" not in scan_info["url"]:

@@ -13,6 +13,7 @@ from infra.dedup import DuplicateChecker
 from crawler.httpx_crawler import fetch_urls_async
 from crawler.response_process import process_scan_result
 from logger import get_logger
+from infra import watchdog
 
 logger = get_logger(__name__)
 
@@ -93,7 +94,7 @@ async def fetch_page_async(page: Page, url: str, progress: tqdm_asyncio):
             }, url, final_status
 
         # 获取页面内容
-        html_content = await page.content()
+        html_content = await asyncio.wait_for(page.content(), timeout=10.0)
 
         # 将捕获到的动态资源拼接到 HTML 尾部
         if captured_resources:
@@ -127,6 +128,7 @@ async def fetch_page_async(page: Page, url: str, progress: tqdm_asyncio):
         }, url, None
     finally:
         progress.update(1)
+        watchdog.beat("page_done", url)      # 每抓完一页=一次真进展
 
 
 async def get_source_async(urls, thread_num, args, checker: DuplicateChecker,
@@ -195,8 +197,15 @@ async def get_source_async(urls, thread_num, args, checker: DuplicateChecker,
             results = await asyncio.gather(*[bounded_fetch(url) for url in urls])
 
         finally:
-            await global_context.close()
-            await browser.close()
+            # 关闭必须有超时：浏览器无响应时，外层 wait_for 取消会卡在这里造成永久死锁
+            try:
+                await asyncio.wait_for(global_context.close(), timeout=5.0)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(browser.close(), timeout=5.0)
+            except Exception:
+                pass
             progress.close()
 
     # 处理失败 URL 的 fallback (使用 httpx)

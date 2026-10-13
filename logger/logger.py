@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
 
 from config.config import (
@@ -23,6 +24,11 @@ LOG_BACKUP_COUNT = 5
 
 CONSOLE_LOG_LEVEL = logging.INFO
 
+# 强制日志用北京时间，避免服务器/容器为 UTC 时比本地慢 8 小时
+_CN_TZ = timezone(timedelta(hours=8))
+def _cn_converter(timestamp):
+    return datetime.fromtimestamp(timestamp, _CN_TZ).timetuple()
+logging.Formatter.converter = staticmethod(_cn_converter)
 
 _initialized = False
 _feishu_sent_time: dict = {}

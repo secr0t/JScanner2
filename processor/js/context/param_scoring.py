@@ -1,5 +1,4 @@
 # C:\Users\Cheng\Desktop\JScanner2\processor\js\context\param_scoring.py
-
 from typing import Optional, Set
 
 from tree_sitter import Node
@@ -14,9 +13,15 @@ _LITERAL_TYPES = {'string', 'number', 'true', 'false', 'null', 'undefined'}
 _DATA_KEYS = frozenset({'data', 'params', 'body', 'query', 'payload'})
 
 
-def get_param_score(func_node: Optional[Node], api_node: Node, code_bytes: bytes) -> int:
+def get_param_score(func_node: Optional[Node], api_node: Node, code_bytes: bytes,
+                    trace: Optional[list] = None) -> int:
     """
     对函数 AST 子树进行参数信号评分（在完整 AST 上操作，非截取文本）
+
+    参数:
+        trace: 可选的追踪列表。传入后每一步命中的信号会被 append 进去，
+               形如 {"stage": "score", "signal": "...", "desc": "...", "score": n}。
+               传 None（默认）时行为与迁移前完全一致。
 
     返回值:
         -1 → 无 enclosing function，无法判定，应放行（避免假阴性）
@@ -32,6 +37,11 @@ def get_param_score(func_node: Optional[Node], api_node: Node, code_bytes: bytes
         信号6: 动态属性赋值构造数据               → +1
     """
     if func_node is None:
+        if trace is not None:
+            trace.append({
+                "stage": "score", "signal": "no_enclosing_function",
+                "desc": "没有外层函数，无法判定", "score": -1,
+            })
         return -1
 
     state = {
@@ -44,33 +54,68 @@ def get_param_score(func_node: Optional[Node], api_node: Node, code_bytes: bytes
         'signal_dynamic_assign': False,
     }
 
+    checks = (
+        ('signal_request_call', '请求调用带 URL 以外的实质参数',
+         lambda n: _check_signal_request_call(n, api_node, code_bytes, state)),
+        ('signal_data_key', '对象 key 是数据承载键 data/params/body/query/payload',
+         lambda n: _check_signal_data_key(n, code_bytes, state)),
+        ('signal_url_concat', 'API URL 参与了变量拼接',
+         lambda n: _check_signal_url_concat(n, api_node, state)),
+        ('signal_formdata', '构造了 FormData / URLSearchParams',
+         lambda n: _check_signal_formdata(n, code_bytes, state)),
+        ('signal_stringify', '调用了 xxx.stringify 序列化',
+         lambda n: _check_signal_stringify(n, code_bytes, state)),
+        ('signal_dynamic_assign', '动态属性赋值构造数据对象',
+         lambda n: _check_signal_dynamic_assign(n, state)),
+    )
+
     def _walk(node: Node):
         if not node:
             return
 
-        if not state['signal_request_call']:
-            _check_signal_request_call(node, api_node, code_bytes, state)
-
-        if not state['signal_data_key']:
-            _check_signal_data_key(node, code_bytes, state)
-
-        if not state['signal_url_concat']:
-            _check_signal_url_concat(node, api_node, state)
-
-        if not state['signal_formdata']:
-            _check_signal_formdata(node, code_bytes, state)
-
-        if not state['signal_stringify']:
-            _check_signal_stringify(node, code_bytes, state)
-
-        if not state['signal_dynamic_assign']:
-            _check_signal_dynamic_assign(node, state)
+        for key, desc, checker in checks:
+            if state[key]:
+                continue
+            before = state['score']
+            checker(node)
+            if state['score'] != before and trace is not None:
+                trace.append({
+                    "stage": "score", "signal": key, "desc": desc,
+                    "score": state['score'] - before,
+                    "line": _line_of(node, code_bytes),
+                })
 
         for child in node.children:
             _walk(child)
 
     _walk(func_node)
     return state['score']
+
+
+def _same_node(a: Optional[Node], b: Optional[Node]) -> bool:
+    """
+    判断两个 Node 是否为同一个节点。
+
+    注意：不能用 `a is b`。tree-sitter 的 Python binding 每次访问 .children /
+    .parent 都会新建 Node 对象，因此"自顶向下遍历"得到的节点和"沿 parent 链
+    向上回溯"得到的节点即使指向同一处，`is` 也为 False。
+
+    本项目里 api_node 来自自顶向下遍历，而 func_node 来自沿 parent 链回溯，
+    后续再从 func_node 往下遍历时拿到的对象与 api_node 不同实例 ——
+    这会让所有 `node is api_node` 判断恒为 False，导致依赖它的信号永不命中。
+    统一改用字节区间比较。
+    """
+    if a is None or b is None:
+        return False
+    return a.start_byte == b.start_byte and a.end_byte == b.end_byte
+
+
+def _line_of(node: Node, code_bytes: bytes) -> int:
+    """节点起始行号（1-based），仅用于追踪输出"""
+    try:
+        return code_bytes[:node.start_byte].count(b'\n') + 1
+    except Exception:
+        return 0
 
 
 # ==================== 辅助函数 ====================
@@ -113,8 +158,10 @@ def _check_signal_request_call(node: Node, api_node: Node, code_bytes: bytes, st
 
     从 API 字符串节点向上查找 call_expression，检查其 arguments 是否包含
     URL 以外的参数（即配置对象、数据对象等）。
+
+    节点同一性判断用 _same_node，不能用 is（原因见 _same_node 注释）。
     """
-    if node is not api_node:
+    if not _same_node(node, api_node):
         return
     call_expr = _find_enclosing_call_expression(api_node)
     if not call_expr:
@@ -174,8 +221,10 @@ def _check_signal_url_concat(node: Node, api_node: Node, state: dict):
 
     从 API string 节点向上查找，如果 parent 是 binary_expression 且
     operator 是 +，说明 URL 在与变量拼接（路径参数）。
+
+    节点同一性判断用 _same_node，不能用 is（原因见 _same_node 注释）。
     """
-    if node is not api_node:
+    if not _same_node(node, api_node):
         return
     current = api_node.parent
     while current and current.type not in _FUNCTION_TYPES:

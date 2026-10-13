@@ -13,6 +13,7 @@ from config.scanner_rules import HTTPX_STATIC_EXTENSIONS, EXCLUDED_CONTEXT_PATTE
     SECRET_DETECTION_BLACKLIST, WEB_TECHNICAL_WORDS
 from config.config import NLTK_DIR
 from infra.bloom import DiskBloomFilter
+from infra import watchdog
 from infra.utils import remove_html_tags
 from logger import get_logger
 from processor.analysis.secret.prompt import SECRET_PROMPT
@@ -376,7 +377,7 @@ class SensitiveInfoScanner:
 
     def scan(self, js_code: str, js_url: str = "") -> List[Dict[str, Any]]:
         if not js_code: return []
-        # logger.info(f"[SCAN] Starting scan for {js_url or 'inline code'}")
+        watchdog.beat("secret_scan", js_url)     # 每个 JS 文件一次真进展
         js_code = self._preprocess(js_code)
         candidates = self._extract_candidates(js_code)
         # logger.info(f"[SCAN] Extracted {len(candidates)} candidates after math filtering")
@@ -389,7 +390,9 @@ class SensitiveInfoScanner:
 
     def _preprocess(self, js_code: str) -> str:
         js_code = remove_html_tags(js_code)
-        try: js_code = format_code(js_code, fallback_on_error=True)
+        try:
+            watchdog.beat("secret_format", "prettier")   # 格式化前喂狗，超大JS慢也不误判
+            js_code = format_code(js_code, fallback_on_error=True)
         except Exception as e: logger.error(f"⚠️ 代码格式化失败：{e}")
         return js_code
 
@@ -436,6 +439,7 @@ class SensitiveInfoScanner:
             batch_num = i // batch_size + 1
             total_batches = (len(candidates) + batch_size - 1) // batch_size
             logger.info(f"🧠 [LLM] 处理批次 {batch_num}/{total_batches} ({len(batch)} 项)")
+            watchdog.beat("secret_llm", f"batch {batch_num}/{total_batches}")
             try:
                 verified_batch = self.llm_verifier.verify_with_context(batch)
                 if verified_batch is None: continue
