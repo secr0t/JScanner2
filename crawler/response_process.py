@@ -69,27 +69,10 @@ async def process_scan_result(scan_info, checker: DuplicateChecker, args, seed_u
         from processor.analysis.api.api_scan import analysis_by_rex, data_clean
         rex_output = analysis_by_rex(source)
 
-        # ===== BaseURL 提取 + Agent 验证（仅在该域名还没有缓存 baseURL 时触发）=====
-        verified_base_url = None
-        if rex_output and ".js" in url and not _is_already_base_url(seed_url):
-            try:
-                from processor.js.context.base_url_extractor import extract_base_url_candidates
-                from processor.analysis.api.base_url_agent import verify_base_url
-
-                candidates = extract_base_url_candidates(source, js_url=url)
-                if candidates:
-                    verified_base_url = verify_base_url(
-                        candidates=candidates,
-                        seed_url=seed_url,
-                        api_paths=rex_output[:5],
-                    )
-                    if verified_base_url:
-                        scan_info["detected_base_url"] = verified_base_url
-                        logger.info(f"🎯 [BaseURL Agent] 验证通过: {verified_base_url}")
-            except Exception as e:
-                logger.warning(f"⚠️ [BaseURL] 提取/验证失败，降级到默认逻辑: {e}")
-
-        effective_seed = verified_base_url if verified_base_url else seed_url
+        # ===== BaseURL 直接使用种子地址 =====
+        # 已去除 base_url_agent 验证：域名/baseURL 由种子地址提供，
+        # 具体 API 的最终路径（含 /security/ 等前缀）由 AI 阶段（reconstruct）直接输出。
+        effective_seed = seed_url
         next_urls = set(data_clean(url, rex_output, seed_url=effective_seed))
 
     except Exception:

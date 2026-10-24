@@ -813,6 +813,153 @@ def _find_callers_of_function(root_node: Node, func_name: str, code_bytes: bytes
     return list(set(callers_code))
 
 
+# ==================== 导出名桥接（增强召回：webpack 跨模块 + Vuex 层） ====================
+# 背景：API wrapper 多为 webpack module 私有名（如 de），真实调用方经
+# n.d(t,"导出名",()=>de) 导出后跨模块调用（常经 Vuex action 中转）。
+# 当同作用域直接调用方为 0 时，用桥接找回业务调用上下文。
+# 该能力是纯增量：只有 caller_codes 为空时才触发，否则行为与旧版完全一致。
+
+_EXPORT_BRIDGE_RE = re.compile(
+    r'n\.d\(\s*t\s*,\s*"([^"]+)"\s*,\s*'
+    r'(?:\(?\s*function\s*\(\s*\)\s*\)?\s*\{\s*return\s+([A-Za-z_$][\w$]*)\s*\}'
+    r'|\(?\s*\(\s*\)\s*=>\s*([A-Za-z_$][\w$]*)\s*\)?)'
+    r'\s*\)'
+)
+_MODULE_FACTORY_RE = re.compile(
+    r'^\s*"[0-9a-f]+"\s*:\s*function\s*\(\s*e\s*,\s*t\s*,\s*n\s*\)\s*\{',
+    re.M,
+)
+_BRIDGE_MAX_DYN_SITES = 50   # 导出名全局动态调用点超过该值视为"过泛"（如 a），跳过防噪声
+_BRIDGE_MAX_SNIPPETS = 3     # 桥接召回的 caller 段数上限（与下游 [:3] 消费一致）
+
+
+def _build_bridge_index(code_bytes: bytes):
+    """一次性构建: webpack 模块边界 + n.d 导出名映射（含字节偏移）。
+    非 webpack 产物或无模块结构时返回 None（调用方走原有逻辑）。"""
+    try:
+        src = code_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    mod_starts = [m.start() for m in _MODULE_FACTORY_RE.finditer(src)]
+    if not mod_starts:
+        return None
+    ranges = []
+    for i, off in enumerate(mod_starts):
+        end = mod_starts[i + 1] if i + 1 < len(mod_starts) else len(src)
+        ranges.append((off, end, src[:off].count("\n") + 1))
+    exports = []
+    for m in _EXPORT_BRIDGE_RE.finditer(src):
+        private_name = m.group(2) or m.group(3)
+        if private_name:
+            exports.append((m.group(1), private_name, src[:m.start()].count("\n") + 1, m.start()))
+    return {"src": src, "ranges": ranges, "exports": exports}
+
+
+def _extract_brace_block(src: str, start_off: int, max_lines: int = 12):
+    """从 start_off 起，用花括号配平（引号感知）截取代码块，超行数上限返回 None"""
+    i = src.find("{", start_off)
+    if i == -1:
+        return None
+    depth = 0
+    in_str = None
+    esc = False
+    for j in range(i, min(len(src), i + 50000)):
+        ch = src[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"', "`"):
+            in_str = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                block = src[start_off:j + 1]
+                return block if block.count("\n") <= max_lines else None
+    return None
+
+
+def _extract_line_at(src: str, off: int, max_len: int = 160):
+    """取 off 所在行的去空白内容（用于动态调用点的语句级上下文）"""
+    ls = src.rfind("\n", 0, off) + 1
+    le = src.find("\n", off)
+    if le == -1:
+        le = len(src)
+    line = src[ls:le].strip()
+    return line if line and len(line) <= max_len else None
+
+
+def _bridge_callers(bridge_index, code_bytes: bytes, wrapper_name: str,
+                    wrapper_byte: int, trace: Optional[list] = None):
+    """wrapper 无直接调用方时，经导出名桥接找回跨模块业务上下文。
+    返回 (caller_snippets, export_chain) 或 None。"""
+    if not bridge_index or not wrapper_name:
+        return None
+    src = bridge_index["src"]
+
+    # 1) 定位 wrapper 所在 webpack 模块
+    mstart = mend = None
+    for off, end, ln in bridge_index["ranges"]:
+        if off <= wrapper_byte < end:
+            mstart, mend = off, end
+            break
+    if mstart is None:
+        return None
+
+    # 2) 模块内导出名桥接（同一模块的 n.d 导出，避免 minified 短名串台）
+    scoped = [e for e in bridge_index["exports"]
+              if e[1] == wrapper_name and mstart <= e[3] < mend]
+    if not scoped:
+        return None
+
+    snippets = []
+    chain = []
+    seen = set()
+    for export_name, _, export_ln, _ in scoped:
+        if len(export_name) < 2:
+            continue
+
+        # 3) 全局动态调用点: Object(a["X"])(t) / a["X"](...) / .X(...)
+        dyn_offs = []
+        for pat in (r'\["?%s"?\]' % re.escape(export_name),
+                    r'\.%s\b' % re.escape(export_name)):
+            for m in re.finditer(pat, src):
+                dyn_offs.append(m.start())
+        if len(dyn_offs) > _BRIDGE_MAX_DYN_SITES:
+            continue   # 导出名过泛，跳过防噪声
+
+        # 4) Vuex action 方法体优先（它携带实参透传关系 + 动态调用语句）
+        act = re.search(
+            r'^\s*%s\(\s*e\s*,\s*t\s*\)\s*\{\s*return\s*new Promise' % re.escape(export_name),
+            src, re.M)
+        if act:
+            block = _extract_brace_block(src, act.start())
+            if block and ("act", act.start()) not in seen:
+                seen.add(("act", act.start()))
+                snippets.append(block)
+
+        # 5) 动态调用所在行（兜底）
+        for off in dyn_offs[:3]:
+            line = _extract_line_at(src, off)
+            if line and ("dyn", line) not in seen:
+                seen.add(("dyn", line))
+                snippets.append(line)
+
+        chain.append(f"{export_name}@L{export_ln}(dyn={len(dyn_offs)})")
+        if len(snippets) >= _BRIDGE_MAX_SNIPPETS:
+            break
+
+    if not snippets:
+        return None
+    return snippets[:_BRIDGE_MAX_SNIPPETS], chain
+
+
 def _extract_multiple_apis_from_bytes(code_bytes: bytes, target_apis: list,
                                       trace: Optional[list] = None) -> Dict[str, Dict[str, Any]]:
     _PARSER = get_parser()
@@ -845,6 +992,9 @@ def _extract_multiple_apis_from_bytes(code_bytes: bytes, target_apis: list,
             "has_error": tree.root_node.has_error,
             "api_line": _line_of(tree.root_node, code_bytes),
         })
+
+    # 桥接索引：webpack 模块边界 + 导出名映射（仅当 caller 为空时使用；非 webpack 产物为 None）
+    bridge_index = _build_bridge_index(code_bytes)
 
     hit_nodes = []
 
@@ -988,6 +1138,21 @@ def _extract_multiple_apis_from_bytes(code_bytes: bytes, target_apis: list,
                 )
 
                 result_data["caller_codes"] = [g["code"] for g in ranked]
+
+                # ---- 桥接：无同作用域直接调用方时，经 webpack 导出名找回跨模块业务上下文 ----
+                if not result_data["caller_codes"] and func_name:
+                    bridged = _bridge_callers(
+                        bridge_index, code_bytes, func_name,
+                        api_node.start_byte, trace)
+                    if bridged:
+                        result_data["caller_codes"], result_data["bridge_chain"] = bridged
+                        if trace is not None:
+                            trace.append({
+                                "stage": "bridge",
+                                "wrapper_name": func_name,
+                                "export_chain": bridged[1],
+                                "callers": len(bridged[0]),
+                            })
 
                 if trace is not None:
                     trace.append({

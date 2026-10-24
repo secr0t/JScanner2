@@ -255,16 +255,9 @@ class Scanner:
         base_prefix = effective_seed.rstrip('/') if effective_seed else None
         origin_url = self.args.url
 
-        all_raw_paths = []
-        for item in batch_all_next_paths_with_source:
-            for p in item.get("next_paths", []):
-                p = p.strip()
-                if p and len(p) >= API_MIN_LENGTH:
-                    all_raw_paths.append(p)
-
+        # 已去除 prefix_agent 前缀验证：API 最终路径（含前缀）由 AI 阶段（reconstruct）
+        # 直接输出，此处不再做前缀聚类判定。verified_clusters 保留为空，默认全量用 base_prefix。
         verified_clusters = {}
-        if base_prefix and _is_already_base_url(base_prefix) and all_raw_paths:
-            verified_clusters = self._verify_prefix_clusters(all_raw_paths, origin_url)
 
         qualified_api_paths = set()
         if getattr(self.args, 'fastscan', False) and batch_next_urls:
@@ -474,6 +467,16 @@ class Scanner:
 
                 full_url = next((item[1] for item in api_data_list if item[0] == api_path), "")
 
+                # 已去除 base_url/prefix Agent：直接使用 AI 输出的最终 path 组装完整 URL
+                # （AI path 已含 /security/ 等拦截器前缀；域名取种子地址 origin）
+                ai_path = advisory_report.get("path", "")
+                if ai_path:
+                    if ai_path.startswith(("http://", "https://")):
+                        full_url = ai_path
+                    else:
+                        parsed = urlparse(origin_url or js_url)
+                        full_url = f"{parsed.scheme}://{parsed.netloc}{ai_path}"
+
                 record_id = self.db_handler.save_ai_result_with_id(
                     js_url=js_url,
                     full_url=full_url,
@@ -633,41 +636,6 @@ class Scanner:
                 if not existing or _is_more_specific(detected, existing):
                     self.domain_base_urls[root_domain] = detected
                     print(f"🎯 [BaseURL] 域名 {root_domain} → {detected}")
-
-    def _verify_prefix_clusters(self, api_paths, origin_url):
-        """
-        对 API paths 按第一级前缀聚类，对大类别进行 prefix 验证。
-
-        Returns:
-            verified_clusters: {prefix: bool} — 每个类别是否使用 prefix
-            未在 dict 中的类别默认使用 prefix
-        """
-        base_prefix = self._get_effective_seed().rstrip('/')
-        if not base_prefix or not _is_already_base_url(base_prefix):
-            return {}
-
-        from processor.analysis.api.prefix_agent import (
-            _cluster_paths_by_prefix,
-            _get_large_clusters,
-            verify_prefix_for_clusters,
-        )
-
-        all_paths = list(set(p.strip() for p in api_paths if p and len(p) >= 4))
-        clusters = _cluster_paths_by_prefix(all_paths)
-        large = _get_large_clusters(clusters)
-
-        if not large:
-            return {}
-
-        print(f"📊 [Prefix] 发现 {len(large)} 个大类别需验证: {', '.join(f'{k}({len(v)})' for k, v in large.items())}")
-
-        verified = verify_prefix_for_clusters(
-            base_prefix=base_prefix,
-            seed_url=origin_url,
-            api_paths_by_cluster=large,
-        )
-
-        return verified
 
     async def _process_single_batch(self, batch_urls: list, depth: int) -> dict:
         """处理单个批次（提取自 _scan_recursive）"""

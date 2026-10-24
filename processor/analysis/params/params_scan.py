@@ -1,5 +1,6 @@
 import difflib
 import hashlib
+import json
 import re
 import time
 import traceback
@@ -13,14 +14,155 @@ from infra.ai_client import client
 from infra.bloom import DiskBloomFilter
 from logger import get_logger
 from processor.analysis.params.param_pre_filter import pre_filter_has_params
+from processor.analysis.params.reconstruct import (
+    apply_reconstruction,
+    extract_reconstruction_bundle,
+)
 from processor.analysis.prompts import (
     SYSTEM_PROMPT_ADVISORY,
     SYSTEM_PROMPT_JUDGE,
     SYSTEM_PROMPT_OPERATION_CLASSIFY,
+    SYSTEM_PROMPT_INFER_PARAMS,
 )
 from processor.js.context.context_extractor import extract_multiple_apis_from_raw_code
 
 logger = get_logger(__name__)
+
+
+# ==================== 信封剥离（增强输出契约） ====================
+# 前端统一封装会把请求体包成协议信封（如腾讯云 security 封装）：
+#   const r = {version, nonceStr, timestamp, signType, content:{...默认...}, sign}
+#   t = JSON.parse(JSON.stringify(r)); e && (t.content = e)
+# 这些字段的默认值是协议常量，不是业务参数；content 由调用方运行时注入。
+# L3 若把 r 的默认值当参数值输出，就是"看似合理"的假参数，必须剥离并标记来源。
+
+ENVELOPE_PROTOCOL_FIELDS = frozenset({
+    "version", "nonceStr", "timestamp", "signType", "sign",
+})
+_ENVELOPE_CONSTRUCT_MARKERS = (
+    "JSON.parse(JSON.stringify(r)",
+    "{...r",
+    "{ ...r",
+    "Object.assign({}, r)",
+)
+_ENVELOPE_INJECT_MARKERS = (
+    "content: e",
+    "content: e ||",
+    "t.content =",
+    "content = e",
+)
+
+
+def _is_envelope_wrapper(wrapper_code: str) -> bool:
+    """判断 wrapper 是否为「公共信封 + content 运行时注入」模式"""
+    if not wrapper_code:
+        return False
+    has_construct = any(mk in wrapper_code for mk in _ENVELOPE_CONSTRUCT_MARKERS)
+    has_inject = any(mk in wrapper_code for mk in _ENVELOPE_INJECT_MARKERS)
+    return has_construct and has_inject
+
+
+def _strip_protocol_params(params):
+    """通用：剥离协议信封字段（version/nonceStr/timestamp/signType/sign）。
+    无论 GET（内联 params）还是 POST（content 载体），这些字段都由拦截器运行时生成，
+    不是业务参数，不应出现在输出里。dict 精确剥离；字符串尽力剥离。"""
+    if not params:
+        return params
+    if isinstance(params, dict):
+        return {k: v for k, v in params.items() if k not in ENVELOPE_PROTOCOL_FIELDS}
+    if isinstance(params, str):
+        text = params.strip()
+        if text.startswith("{"):
+            return params
+        for key in ENVELOPE_PROTOCOL_FIELDS:
+            text = re.sub(r'(^|[,&])%s\s*=[^,&]*' % re.escape(key), '', text)
+        return re.sub(r'^[,&]+|(?<=[,&])[,&]+', '', text).strip('&,').strip()
+    return params
+
+
+def _split_inferred_params(parsed):
+    """将 AI 返回的 inferred_params 分离为独立字段，避免污染已验证的 params。"""
+    inferred = parsed.pop("inferred_params", None)
+    if isinstance(inferred, str):
+        try:
+            inferred = json_repair.loads(inferred)
+        except Exception:
+            inferred = None
+    if isinstance(inferred, dict) and inferred:
+        parsed["inferred_params"] = inferred
+    return parsed
+
+
+def _deep_merge(base: dict, extra: dict) -> dict:
+    """递归合并两个 dict（extra 覆盖 base），用于把推断结构注入已验证的 JSON 参数值。"""
+    out = dict(base)
+    for k, v in extra.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _merge_inferred_params(parsed):
+    """将 inferred_params 并入 params（content 类 JSON 值做结构合并），生成 param_note。
+
+    与 JSAtlas 输出契约对齐：params 是单一"参数名→值"映射，推断字段注入其中；
+    param_note 标注哪些是推断的（未在代码验证），防止把猜测当已验证。
+    """
+    params = parsed.get("params")
+    inferred = parsed.get("inferred_params")
+    parsed.pop("inferred_params", None)
+    if not inferred or not isinstance(inferred, dict) or not isinstance(params, dict):
+        return parsed
+    notes = []
+    for key, inval in inferred.items():
+        ival = (
+            json.dumps(inval, ensure_ascii=False)
+            if isinstance(inval, (dict, list))
+            else ("" if inval is None else str(inval))
+        )
+        if key in params:
+            pval = params[key]
+            if (
+                isinstance(pval, str)
+                and pval.lstrip().startswith("{")
+                and isinstance(inval, dict)
+            ):
+                try:
+                    pj = json.loads(pval)
+                    if isinstance(pj, dict):
+                        params[key] = json.dumps(
+                            _deep_merge(pj, inval), ensure_ascii=False
+                        )
+                        notes.append(f"{key} 结构已按推断补全")
+                        continue
+                except Exception:
+                    pass
+            params[key] = ival
+            notes.append(f"{key} 值由推断生成")
+        else:
+            params[key] = ival
+            notes.append(f"{key} 为推断字段")
+    if notes:
+        parsed["param_note"] = "；".join(notes) + "（推断内容未在代码验证，构造请求时注意）"
+    return parsed
+
+
+_ENVELOPE_CARRIER_KEYS = ("content", "data", "body", "query", "payload")
+
+
+def _envelope_carrier_key(params):
+    """找信封业务参数载体键（content/data/body/...），默认 content。"""
+    if isinstance(params, dict):
+        for k in _ENVELOPE_CARRIER_KEYS:
+            if k in params:
+                return k
+        return "content"
+    if isinstance(params, str):
+        m = re.search(r'(?:^|[,&])(%s)\s*=' % "|".join(_ENVELOPE_CARRIER_KEYS), params)
+        return m.group(1) if m else "content"
+    return "content"
 
 
 class AISecurityAuditor:
@@ -1396,6 +1538,15 @@ class AISecurityAuditor:
             "",
         )
 
+        # ---- 信封识别（公共封装 + content 运行时注入）----
+        bridge_chain = context_data.get("bridge_chain") or []
+        is_envelope = _is_envelope_wrapper(context_data.get("wrapper_code", ""))
+        if is_envelope:
+            logger.info(
+                f"[{api_url}] 📦 检测到协议信封 wrapper，"
+                f"业务参数经 content 运行时注入"
+            )
+
         try:
             raw_wrapper = context_data.get(
                 "wrapper_code",
@@ -1557,6 +1708,39 @@ class AISecurityAuditor:
         # Prompt
         # --------------------------------------------------------
 
+        envelope_note = ""
+        if is_envelope:
+            envelope_note = (
+                "【重要】该 API 使用公共请求信封（version/nonceStr/timestamp/signType/sign "
+                "为协议字段，运行时由拦截器重写，不是业务参数，务必剥离）。"
+                "content 是业务参数载体：调用方代码可见时提取真实参数结构；"
+                "不可见时保留信封默认结构作为形状提示，"
+                "并按接口语义在 inferred_params 中推断其可能业务结构（分页/日期/筛选等），"
+                "推断内容不得混入 params。"
+            )
+
+        # ---- 请求重构信息（拦截器层）：协议字段必须剥离、最终路径仅作参考 ----
+        reconstruct = context_data.get("reconstruct") or {}
+        reconstruct_note = ""
+        if reconstruct:
+            proto_fields = ", ".join(
+                reconstruct.get("envelope_rewrite", {}).keys()
+            )
+            reconstruct_note = (
+                "【请求重构信息（拦截器，来自 bundle 分析）】\n"
+                f"- 信封协议字段（运行时重写，非业务参数，"
+                f"必须从 params 剥离）: {proto_fields or '无'}\n"
+                f"- 最终请求路径: "
+                f"{reconstruct.get('final_path', api_url)}\n"
+                f"- 路径前缀: "
+                f"{reconstruct.get('path_prefix', '') or '无'}\n"
+                f"- 是否豁免加密: "
+                f"{reconstruct.get('api_is_exempt', False)}\n"
+                "（params 只输出业务参数；协议字段由拦截器运行时生成，"
+                "构造请求时自行计算；path 仍输出代码中的原路径，"
+                "最终路径由代码层并入）\n\n"
+            )
+
         user_prompt = f"""
 {param_keys_hint}=== 【前端 JS 代码证据】 ===
 {full_code}
@@ -1565,7 +1749,8 @@ class AISecurityAuditor:
 
 {value_hint}
 
-请严格按照 Prompt 要求提取请求信息。
+{envelope_note}
+{reconstruct_note}请严格按照 Prompt 要求提取请求信息。
 """
 
         messages = [
@@ -1613,6 +1798,29 @@ class AISecurityAuditor:
             if "danger_reason" not in parsed:
                 parsed["danger_reason"] = ""
 
+            # ---- 协议字段剥离（通用）：version/nonceStr/timestamp/signType/sign 不是业务参数 ----
+            parsed["params"] = _strip_protocol_params(parsed.get("params"))
+            # ---- 推断参数分离：inferred_params 独立于已验证 params，避免污染 ----
+            _split_inferred_params(parsed)
+            # ---- 信封元数据：content 为运行时注入，附桥接链来源 ----
+            if is_envelope:
+                parsed["param_source"] = {
+                    "kind": "envelope_runtime_inject",
+                    "note": "content 由调用方运行时注入；保留的结构为信封默认形状提示",
+                    "bridge_chain": bridge_chain or None,
+                }
+                # ---- 兜底：AI 未推断出结构时，主动推断一次（按 wrapper 缓存） ----
+                if "inferred_params" not in parsed:
+                    inferred_body = self._infer_envelope_structure(
+                        raw_wrapper,
+                        api_url,
+                        parsed.get("params"),
+                        wrapper_code,
+                    )
+                    if inferred_body:
+                        carrier = _envelope_carrier_key(parsed.get("params"))
+                        parsed["inferred_params"] = {carrier: inferred_body}
+
             logger.info(
                 f"[VULN-AUDIT] [{api_url}]\n"
                 f"  ┌─ context_type "
@@ -1652,6 +1860,71 @@ class AISecurityAuditor:
             )
 
             return None
+
+    # ============================================================
+    # Envelope 结构推断兜底：AI 未给 inferred_params 时主动推断
+    # ============================================================
+
+    # 按 wrapper 归一化串缓存推断结果（同结构 wrapper 只推断一次）
+    _INFER_STRUCTURE_CACHE: dict = {}
+
+    def _infer_envelope_structure(
+        self,
+        raw_wrapper: str,
+        api_url: str,
+        params_value,
+        wrapper_code: str,
+    ):
+        """信封 API 且 AI 未推断出结构时，用专门 prompt 推断一次。"""
+        if not params_value or not wrapper_code:
+            return None
+
+        try:
+            key = self._normalize_cache_key(raw_wrapper, api_url)
+        except Exception:
+            key = None
+
+        if key and key in self._INFER_STRUCTURE_CACHE:
+            return self._INFER_STRUCTURE_CACHE[key]
+
+        user_prompt = (
+            f"接口路径: {api_url}\n\n"
+            f"信封默认 {_envelope_carrier_key(params_value)} 结构"
+            f"（可能是业务形状骨架）:\n{params_value}\n\n"
+            f"调用的底层 wrapper 代码:\n{wrapper_code[:4000]}"
+        )
+
+        inferred_obj = None
+        try:
+            result = client.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": SYSTEM_PROMPT_INFER_PARAMS,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                max_tokens=800,
+                temperature=0.3,
+            )
+            parsed_infer = json_repair.loads(
+                self._clean_json_response(result)
+            )
+            if isinstance(parsed_infer, dict) and parsed_infer:
+                inferred_obj = parsed_infer
+        except Exception as infer_err:
+            logger.warning(
+                f"[{api_url}] Envelope 结构推断失败，跳过："
+                f"{infer_err}"
+            )
+
+        if key is not None:
+            self._INFER_STRUCTURE_CACHE[key] = inferred_obj
+
+        return inferred_obj
 
     # ============================================================
     # 基础 API Path 黑名单
@@ -1817,6 +2090,9 @@ class AISecurityAuditor:
 
         level_2_candidates = []
 
+        # 请求重构信息（bundle 级只扫一次；随后按 API 判定豁免与最终路径）
+        rc_bundle = extract_reconstruction_bundle(js_code)
+
         # --------------------------------------------------------
         # Step 2：上下文过滤
         # --------------------------------------------------------
@@ -1833,6 +2109,11 @@ class AISecurityAuditor:
                 or not context_data.get("found")
             ):
                 continue
+
+            context_data["reconstruct"] = apply_reconstruction(
+                rc_bundle,
+                api_path,
+            )
 
             wrapper_code = context_data.get(
                 "wrapper_code",
@@ -1995,11 +2276,14 @@ class AISecurityAuditor:
                     f"AI确认无参数，记录空结果"
                 )
 
+                rc_cur = context_data.get("reconstruct") or {}
                 results[api_path] = {
-                    "path": api_path,
+                    "path": rc_cur.get("final_path") or api_path,
                     "method": "",
                     "params": "",
                 }
+                if rc_cur:
+                    results[api_path]["reconstruct"] = rc_cur
                 continue
 
             logger.info(
@@ -2028,6 +2312,15 @@ class AISecurityAuditor:
                 context_data=context_data,
                 param_keys=param_keys,
             )
+
+            if isinstance(analysis_result, dict):
+                # 与 JSAtlas 输出契约对齐：合并推断参数 + 最终路径 + 挂载重构信息
+                _merge_inferred_params(analysis_result)
+                rc_cur = context_data.get("reconstruct") or {}
+                if rc_cur.get("final_path"):
+                    analysis_result["path"] = rc_cur["final_path"]
+                if rc_cur:
+                    analysis_result["reconstruct"] = rc_cur
 
             results[api_path] = (
                 analysis_result
