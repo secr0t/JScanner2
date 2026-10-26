@@ -106,6 +106,14 @@ Unlike traditional regex-based tools, JScanner2 understands code semantics, extr
 
 ---
 
+## 🔐 Secret Detection Algorithm
+
+JScanner2's AI-assisted secret detection pipeline uses **entropy and tokenization-based candidate scoring**, then combines AST context analysis with LLM verification to assess potential secrets in JavaScript source code.
+
+The algorithm and its technical details are publicly documented in this [Xianzhi Community article (Chinese)](https://xz.aliyun.com/news/91962). This project uses the documented approach as part of its secret-detection workflow.
+
+---
+
 ## 💡 Why JScanner2
 
 ### ❌ Limitations of Traditional Tools
