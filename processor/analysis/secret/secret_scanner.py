@@ -375,14 +375,24 @@ class SensitiveInfoScanner:
         self.ast_available = SenInfoContextExtractor is not None
         self._local_logger = get_logger("SensitiveInfoScanner")
 
-    def scan(self, js_code: str, js_url: str = "") -> List[Dict[str, Any]]:
+    def scan(self, js_code: str, js_url: str = "", bundle_context: Optional[dict] = None,
+             js_file: str = "") -> List[Dict[str, Any]]:
+        """扫描单个 JS 文件中的敏感信息。
+
+        bundle_context（可选）：跨 chunk 召回上下文（含 chunk_dir / index），
+        由 main 构建后传入。当单文件内找不到密钥调用者时，用宿主变量名经
+        调用点索引反查其他 chunk 的引用点，实现密钥跨 chunk 调用方召回。
+        js_file（可选）：当前文件在 chunk 目录中的文件名，用于跨 chunk 召回时
+        过滤定义文件自身；缺省时从 js_url 推断。
+        """
         if not js_code: return []
         watchdog.beat("secret_scan", js_url)     # 每个 JS 文件一次真进展
         js_code = self._preprocess(js_code)
         candidates = self._extract_candidates(js_code)
         # logger.info(f"[SCAN] Extracted {len(candidates)} candidates after math filtering")
         if not candidates: return []
-        if self.ast_available: candidates = self._enrich_with_ast(candidates, js_code)
+        if self.ast_available:
+            candidates = self._enrich_with_ast(candidates, js_code, bundle_context, js_file)
         if len(candidates) > self.max_llm: candidates = self._priority_sort(candidates)[:self.max_llm]
         verified = self._verify_with_llm(candidates)
         if self.db and js_url and verified is not None: self.db.save_sensitive_info(js_url, verified)
@@ -406,7 +416,8 @@ class SensitiveInfoScanner:
                 candidate_objects.append({"id": i, "value": content, "original_line": line, "context": "", "callers": []})
         return candidate_objects
 
-    def _enrich_with_ast(self, candidates: List[Dict[str, Any]], js_code: str) -> List[Dict[str, Any]]:
+    def _enrich_with_ast(self, candidates: List[Dict[str, Any]], js_code: str,
+                         bundle_context: Optional[dict] = None, js_file: str = "") -> List[Dict[str, Any]]:
         try:
             extractor = SenInfoContextExtractor(js_code)
             if len(candidates) > self.max_ast_analysis: candidates = self._priority_sort(candidates)[:self.max_ast_analysis]
@@ -414,9 +425,36 @@ class SensitiveInfoScanner:
                 context = extractor.get_full_context(cand["value"])
                 cand["context"] = context.get("declaration", "")
                 cand["callers"] = context.get("callers", [])
+                cand["host_var"] = context.get("host_var", "")
+                # 单文件内无调用者时，尝试跨 chunk 召回（复用 bundle 调用点索引）
+                if bundle_context and not cand["callers"] and cand.get("host_var"):
+                    cc = self._cross_chunk_secret_callers(bundle_context, cand["host_var"], js_file)
+                    if cc:
+                        cand["callers"] = cc
+                        cand["cross_chunk"] = True
         except Exception as e:
             logger.error(f"⚠️ AST 上下文提取失败：{e}")
         return candidates
+
+    def _cross_chunk_secret_callers(self, bundle_context: dict, host_var: str, js_file: str) -> List[str]:
+        """用 bundle 调用点索引反查其他 chunk 引用该密钥宿主变量的调用上下文。"""
+        try:
+            from processor.js.context import bundle_index as bi
+            chunk_dir = bundle_context.get("chunk_dir")
+            index = bundle_context.get("index")
+            if not chunk_dir or not index:
+                return []
+            # 从 js_url 推断当前文件名（缺省 js_file 时）
+            def_file = js_file or ""
+            if not def_file:
+                url = bundle_context.get("js_url", "")
+                if url:
+                    def_file = url.rsplit("/", 1)[-1]
+            res = bi.find_secret_callers(chunk_dir, index, host_var, def_file=def_file)
+            return [c["code"] for c in res.get("callers", [])]
+        except Exception as e:
+            self._local_logger.error(f"⚠️ [Secret] 跨 chunk 调用方召回失败：{e}")
+            return []
 
     def _priority_sort(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         def priority_score(cand):

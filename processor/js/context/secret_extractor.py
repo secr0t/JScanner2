@@ -71,7 +71,8 @@ class SenInfoContextExtractor:
             "found": False,
             "declaration": "",
             "wrapper_func": "",
-            "callers": []
+            "callers": [],
+            "host_var": "",
         }
 
         node = self.find_string_node(target_value)
@@ -82,6 +83,9 @@ class SenInfoContextExtractor:
 
         # 复用现有切片函数
         result["declaration"] = _extract_heuristic_slice(node, self.code_bytes)
+
+        # 提取宿主变量/属性名：密钥值被赋值给谁（供跨 chunk 调用点召回锚定）
+        result["host_var"] = self._extract_host_var(node)
 
         # 复用现有函数找包裹函数
         func_node = _find_enclosing_function(node)
@@ -94,6 +98,41 @@ class SenInfoContextExtractor:
                 result["callers"] = self._find_callers(func_name)
 
         return result
+
+    def _extract_host_var(self, node: Node) -> str:
+        """从密钥字符串节点的 AST 父节点提取宿主变量/属性名。
+
+        覆盖三种常见形态（供跨 chunk 调用点召回锚定）：
+          - `const API_KEY = "..."`        → variable_declarator.name = API_KEY
+          - `var config = {secret:"..."}`  → 配置对象属性：取配置对象变量名 config
+          - `config.secret = "..."`        → assignment_expression.left = config.secret
+        无法识别时返回空串（调用方跳过跨 chunk 召回）。
+        """
+        if not node or not node.parent:
+            return ""
+        p = node.parent
+
+        def _field_text(field_node):
+            if field_node is None:
+                return ""
+            return self.code_bytes[field_node.start_byte:field_node.end_byte].decode('utf-8', 'replace').strip()
+
+        if p.type == 'variable_declarator':
+            return _field_text(p.child_by_field_name('name'))
+        if p.type == 'pair':
+            # 配置对象属性：`{secret:"..."}` 的宿主是配置对象变量名
+            # 向上找 object → 其父 variable_declarator 的 name
+            obj = p.parent
+            if obj and obj.type == 'object' and obj.parent:
+                gp = obj.parent
+                if gp.type == 'variable_declarator':
+                    return _field_text(gp.child_by_field_name('name'))
+                if gp.type == 'assignment_expression':
+                    return _field_text(gp.child_by_field_name('left'))
+            return _field_text(p.child_by_field_name('key'))
+        if p.type == 'assignment_expression':
+            return _field_text(p.child_by_field_name('left'))
+        return ""
 
     def _find_callers(self, func_name: str) -> List[str]:
         return _find_callers_of_function(self.tree.root_node, func_name, self.code_bytes)
