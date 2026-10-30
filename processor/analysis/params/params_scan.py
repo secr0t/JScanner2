@@ -2021,6 +2021,7 @@ class AISecurityAuditor:
         js_code: str,
         api_paths: list,
         target_url: str,
+        bundle_context: Optional[dict] = None,
     ) -> Dict[
         str,
         Optional[Dict[str, Any]]
@@ -2035,6 +2036,12 @@ class AISecurityAuditor:
             Level 2
               ↓
             Level 3
+
+        bundle_context（可选）：跨 chunk 召回上下文，形如
+            {"chunk_dir": str, "index": dict, "cross_chunk_recall": callable,
+             "find_api_callers": callable, "resolve_export_name": callable}
+        传入后，对 caller_codes 为空的 API 会用跨文件召回补充定义片段与调用方参数
+        （不依赖 AI）。None 时保持原单文件召回行为。
         """
 
         results = {}
@@ -2066,6 +2073,7 @@ class AISecurityAuditor:
                 extract_multiple_apis_from_raw_code(
                     js_code,
                     api_paths,
+                    bundle_context=bundle_context,
                 )
             )
 

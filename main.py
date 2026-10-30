@@ -41,6 +41,118 @@ API_MIN_LENGTH = 4
 HTML_EXTS = {'.html', '.htm', '.xhtml'}
 
 
+def _build_bundle_context(js_url: str, seed_url: str, collect_if_missing: bool = True):
+    """为入口 JS 构建跨 chunk 召回上下文；失败/非 webpack 时返回 None（优雅降级）。
+
+    策略：
+      1. chunk 缓存目录 = Result/bundle_chunks/<md5(js_url)>，按入口 URL 隔离。
+      2. 目录已存在（含入口 JS）→ 直接构建索引（走缓存，不重新下载）。
+      3. 目录不存在 → 若 collect_if_missing 则尝试用 bundle_collector 采集；
+         否则（密钥扫描阶段）直接返回 None，避免对 chunk 文件重复采集。
+    返回 {"chunk_dir", "index", "cross_chunk_recall",
+           "find_api_callers", "resolve_export_name", "find_secret_callers"} 或 None。
+    """
+    try:
+        from processor.js.context import bundle_index as bi
+        from processor.js.context.bundle_collector import collect_chunks_sync
+
+        import hashlib
+        chunk_dir = os.path.join(
+            "Result", "bundle_chunks", hashlib.md5(js_url.encode()).hexdigest()[:16])
+
+        # 目录已有入口 JS（上次采集过）→ 直接构建索引
+        if not (os.path.isdir(chunk_dir) and os.listdir(chunk_dir)):
+            if not collect_if_missing:
+                return None
+            # 额外下载 js_url 指向的独立 JS 文件（非 webpack chunk，如 UMD 库），
+            # 确保跨 chunk 索引能覆盖它（collect_chunks 默认只采首页入口 JS + webpack chunk）
+            collect_chunks_sync(seed_url, chunk_dir, extra_js_urls=[js_url] if js_url else None)
+
+        index = bi.get_bundle_index(chunk_dir)
+        if not index or not index.get("files"):
+            return None
+        return {
+            "chunk_dir": chunk_dir,
+            "index": index,
+            "js_url": js_url,
+            "cross_chunk_recall": bi.cross_chunk_recall,
+            "find_api_callers": bi.find_api_callers,
+            "resolve_export_name": bi.resolve_export_name,
+            "find_secret_callers": bi.find_secret_callers,
+        }
+    except Exception:
+        return None
+
+
+def _assemble_bundle_context(js_url: str, chunk_dir: str, index: dict):
+    """把 chunk_dir + index 组装成 _build_bundle_context 的返回结构（含函数引用）。
+
+    并行构建时，子进程只产出纯数据 index；函数引用（cross_chunk_recall /
+    find_api_callers / resolve_export_name / find_secret_callers）在主进程组装，
+    避免把不可 pickle 的模块函数传入子进程。
+    """
+    from processor.js.context import bundle_index as bi
+    return {
+        "chunk_dir": chunk_dir,
+        "index": index,
+        "js_url": js_url,
+        "cross_chunk_recall": bi.cross_chunk_recall,
+        "find_api_callers": bi.find_api_callers,
+        "resolve_export_name": bi.resolve_export_name,
+        "find_secret_callers": bi.find_secret_callers,
+    }
+
+
+async def _build_bundle_contexts_many(js_urls, seed_url: str, collect_if_missing: bool = True):
+    """并行构建多个 js_url 的跨 chunk 召回上下文。返回 {js_url: context_or_None}。
+
+    方案 B：把串行的"采集 + 建索引"并行化。
+      1. 采集（I/O 密集）：对缺失的 chunk_dir 用原生 collect_chunks 并发下载，
+         在 async 上下文里 asyncio.gather，不阻塞主事件循环。
+      2. 建索引（CPU 密集）：用 ProcessPoolExecutor 并行 build_bundle_index，
+         子进程产出纯数据 index，主进程写入 _INDEX_CACHE 并组装 context。
+    单个 js_url 失败只影响它自己（返回 None），不影响其他 js_url。
+    """
+    import hashlib
+    from concurrent.futures import ProcessPoolExecutor
+    from processor.js.context import bundle_index as bi
+    from processor.js.context.bundle_collector import collect_chunks
+
+    chunk_dir_map = {}
+    for js_url in js_urls:
+        chunk_dir = os.path.join(
+            "Result", "bundle_chunks", hashlib.md5(js_url.encode()).hexdigest()[:16])
+        chunk_dir_map[js_url] = chunk_dir
+
+    # 1) 并发采集缺失的 chunk_dir
+    to_collect = [(js_url, cd) for js_url, cd in chunk_dir_map.items()
+                  if not (os.path.isdir(cd) and os.listdir(cd))]
+    if to_collect and collect_if_missing:
+        # 每个 js_url 额外下载其指向的独立 JS 文件（非 webpack chunk，如 UMD 库），
+        # 确保跨 chunk 索引能覆盖它（collect_chunks 默认只采首页入口 JS + webpack chunk）
+        await asyncio.gather(
+            *(collect_chunks(seed_url, cd, extra_js_urls=[js_url] if js_url else None)
+              for js_url, cd in to_collect),
+            return_exceptions=True)
+
+    # 2) 并行建索引（CPU 密集）
+    ready = [js_url for js_url, cd in chunk_dir_map.items()
+             if os.path.isdir(cd) and os.listdir(cd)]
+    results = {}
+    if ready:
+        ready_dirs = [chunk_dir_map[js_url] for js_url in ready]
+        workers = min(os.cpu_count() or 1, len(ready))
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            indexes = list(ex.map(bi.build_bundle_index, ready_dirs))
+        for js_url, index in zip(ready, indexes):
+            if not index or not index.get("files"):
+                continue
+            cd = chunk_dir_map[js_url]
+            bi._INDEX_CACHE[cd] = index  # 进程内缓存，供后续 get_bundle_index 命中
+            results[js_url] = _assemble_bundle_context(js_url, cd, index)
+    return results
+
+
 def _is_more_specific(new_url: str, old_url: str) -> bool:
     """新 baseURL 的路径前缀比旧的更长，说明更精确"""
     from urllib.parse import urlparse
@@ -407,6 +519,19 @@ class Scanner:
 
         vuln_records_for_request = []
 
+        # 方案 B：并行构建本批次所有 js_url 的跨 chunk 召回上下文。
+        # 采集（I/O 密集）用 asyncio.gather 并发，建索引（CPU 密集）用
+        # ProcessPoolExecutor 并行；返回 {js_url: context_or_None}。
+        bundle_contexts = {}
+        try:
+            bundle_contexts = await _build_bundle_contexts_many(
+                list(js_groups.keys()),
+                effective_seed.strip() if effective_seed else self.args.url.strip(),
+            )
+        except Exception:
+            print_exc()
+            logger.error("❌ [AI] 并行构建 bundle context 失败，降级为逐个构建")
+
         for js_url, api_data_list in js_groups.items():
             js_source = source_map.get(js_url, "")
             if not js_source:
@@ -422,10 +547,19 @@ class Scanner:
             )
 
             try:
+                # 跨 chunk 召回上下文（webpack 入口 JS 才有效；失败自动降级为 None）
+                bundle_context = bundle_contexts.get(js_url)
+                if bundle_context is None:
+                    # 并行构建未覆盖（如采集/建索引失败）→ 回退到原串行逻辑
+                    bundle_context = _build_bundle_context(
+                        js_url,
+                        effective_seed.strip() if effective_seed else self.args.url.strip(),
+                    )
                 batch_ai_advisories = self.ai_auditor.scan_multiple_apis(
                     js_code=js_source,
                     api_paths=api_paths,
-                    target_url=effective_seed.strip() if effective_seed else self.args.url.strip()
+                    target_url=effective_seed.strip() if effective_seed else self.args.url.strip(),
+                    bundle_context=bundle_context,
                 )
             except Exception as e:
                 print_exc()
@@ -826,7 +960,16 @@ class Scanner:
             combined_sensitive_info = set()
             if self.args.analyzeSensitiveInfoAI and self.sensitive_scanner:
                 try:
-                    ai_results = self.sensitive_scanner.scan(js_code=scan_info["source_code"], js_url=url)
+                    # 跨 chunk 密钥召回：复用 API 阶段已采集的 chunk 缓存（不重新采集）
+                    bundle_context = _build_bundle_context(
+                        url,
+                        self._get_effective_seed() or (self.args.url.strip() if self.args.url else ""),
+                        collect_if_missing=False,
+                    )
+                    js_file = url.rsplit("/", 1)[-1]
+                    ai_results = self.sensitive_scanner.scan(
+                        js_code=scan_info["source_code"], js_url=url,
+                        bundle_context=bundle_context, js_file=js_file)
                     if ai_results:
                         for item in ai_results:
                             combined_sensitive_info.add(item.get("value", ""))

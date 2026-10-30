@@ -95,6 +95,58 @@ def _extract_string_content(node_bytes: bytes) -> Optional[str]:
     return text
 
 
+# 作用域声明收集缓存：key = 作用域节点 id，value = 该作用域内的声明/赋值节点列表。
+# 同一作用域节点会被多个变量查询重复遍历，缓存可避免对顶层 program 反复全树扫描。
+_SCOPE_DECLS_CACHE: Dict[int, List[Node]] = {}
+
+# 作用域声明范围缓存：key = 作用域节点 id，value = 声明名 -> (声明节点 start_byte, end_byte)。
+# 用于精确复刻 _is_declared_in_function 按"单个声明字节范围是否落在函数范围内"的过滤，
+# 避免把整个 program 作用域因 scope 节点越界而整体排除。
+_SCOPE_DECL_RANGES_CACHE: Dict[int, Dict[str, Tuple[int, int]]] = {}
+
+
+def _scope_decl_ranges(scope_node: Node, code_bytes: bytes) -> Dict[str, Tuple[int, int]]:
+    """返回某作用域内所有声明名 -> (声明节点 start_byte, end_byte) 的映射。
+
+    语义与 _is_declared_in_function 的作用域链一致：收集该作用域内（含嵌套函数）所有
+    variable_declaration / lexical_declaration / assignment_expression 的声明名及其字节范围，
+    供调用方按"声明字节落在函数范围内"精确过滤。
+    """
+    cached = _SCOPE_DECL_RANGES_CACHE.get(scope_node.id)
+    if cached is not None:
+        return cached
+    result: Dict[str, Tuple[int, int]] = {}
+    _collect_decl_ranges_in_subtree(scope_node, result, code_bytes)
+    _SCOPE_DECL_RANGES_CACHE[scope_node.id] = result
+    return result
+
+
+def _collect_decl_ranges_in_subtree(node: Node, result: Dict[str, Tuple[int, int]],
+                                    code_bytes: bytes, skip_functions: bool = False):
+    """递归收集节点子树中所有声明名及其声明节点字节范围（含嵌套函数，复刻作用域链语义）。"""
+    if node.type in ('variable_declaration', 'lexical_declaration'):
+        decl_start = node.start_byte
+        decl_end = node.end_byte
+        for child in node.children:
+            if child.type != 'variable_declarator':
+                continue
+            name_node = child.child_by_field_name('name')
+            if name_node and name_node.type == 'identifier':
+                name = code_bytes[name_node.start_byte:name_node.end_byte].decode('utf-8')
+                result.setdefault(name, (decl_start, decl_end))
+        return
+    if node.type == 'assignment_expression':
+        left = node.child_by_field_name('left')
+        if left and left.type == 'identifier':
+            name = code_bytes[left.start_byte:left.end_byte].decode('utf-8')
+            result.setdefault(name, (node.start_byte, node.end_byte))
+        return
+    for child in node.children:
+        if skip_functions and child.type in _FUNCTION_TYPES:
+            continue
+        _collect_decl_ranges_in_subtree(child, result, code_bytes, skip_functions)
+
+
 def _build_scope_chain(usage_node: Node, code_bytes: bytes) -> List[List[Node]]:
     """
     从使用点向上遍历，收集作用域链（局部 → 全局）
@@ -105,8 +157,11 @@ def _build_scope_chain(usage_node: Node, code_bytes: bytes) -> List[List[Node]]:
 
     while current:
         if _is_scope_boundary(current):
-            scope_decls = []
-            _collect_decls_in_subtree(current, scope_decls)
+            scope_decls = _SCOPE_DECLS_CACHE.get(current.id)
+            if scope_decls is None:
+                scope_decls = []
+                _collect_decls_in_subtree(current, scope_decls)
+                _SCOPE_DECLS_CACHE[current.id] = scope_decls
             scopes.append(scope_decls)
             if current.type == 'program':
                 break
@@ -427,16 +482,44 @@ def _collect_free_var_declarations(func_node: Node, api_node: Node, code_bytes: 
                 _walk_params(child)
         _walk_params(params_node)
 
+    # 精确复刻 _is_declared_in_function(func_node, name, usage_node) 语义：
+    # name 在 usage_node 的祖先作用域链中某个作用域内声明，且该声明的字节范围落在 func_node 范围内。
+    # 用作用域声明范围缓存（_SCOPE_DECL_RANGES_CACHE）替代逐声明遍历，O(作用域深度) 字典查找，
+    # 避免 O(identifier 数 × 声明数) 的二次复杂度。
+    func_start = func_node.start_byte
+    func_end = func_node.end_byte
+
+    def _is_declared(name: str, usage_node: Node) -> bool:
+        current = usage_node.parent
+        while current:
+            if _is_scope_boundary(current):
+                ranges = _scope_decl_ranges(current, code_bytes)
+                decl_range = ranges.get(name)
+                if decl_range is not None:
+                    decl_start, decl_end = decl_range
+                    if decl_start >= func_start and decl_end <= func_end:
+                        return True
+                if current.type == 'program':
+                    break
+            current = current.parent
+        return False
+
+    # 同一变量名在函数内会被大量重复引用，缓存 _find_var_value_node 结果避免重复作用域链扫描。
+    var_value_cache = {}
+
     def _collect(node):
         if node.type == 'identifier':
             name = code_bytes[node.start_byte:node.end_byte].decode('utf-8')
             if name in param_names or name in free_vars:
                 return
 
-            if _is_declared_in_function(func_node, name, node, code_bytes):
+            if _is_declared(name, node):
                 return
 
-            value_node = _find_var_value_node(name, node, code_bytes)
+            value_node = var_value_cache.get(name)
+            if value_node is None and name not in var_value_cache:
+                value_node = _find_var_value_node(name, node, code_bytes)
+                var_value_cache[name] = value_node
             if value_node and value_node.type in ('object', 'array', 'string'):
                 free_vars.add(name)
 
@@ -819,15 +902,18 @@ def _find_callers_of_function(root_node: Node, func_name: str, code_bytes: bytes
 # 当同作用域直接调用方为 0 时，用桥接找回业务调用上下文。
 # 该能力是纯增量：只有 caller_codes 为空时才触发，否则行为与旧版完全一致。
 
+# webpack 导出名桥接：`t.d(a, "name", () => X)` / `n.d(t, "name", () => X)`
+# 模块工厂参数名在不同产物中不固定（e,t,n / e,a,t / e,t,r ...），用占位符匹配任意单字母参数名。
 _EXPORT_BRIDGE_RE = re.compile(
-    r'n\.d\(\s*t\s*,\s*"([^"]+)"\s*,\s*'
+    r'([A-Za-z_$][\w$]*)\.d\(\s*[A-Za-z_$][\w$]*\s*,\s*"([^"]+)"\s*,\s*'
     r'(?:\(?\s*function\s*\(\s*\)\s*\)?\s*\{\s*return\s+([A-Za-z_$][\w$]*)\s*\}'
     r'|\(?\s*\(\s*\)\s*=>\s*([A-Za-z_$][\w$]*)\s*\)?)'
     r'\s*\)'
 )
+# webpack 模块工厂：`"0d85": function(e, a, t) {` 或 `26fca:function(e,a,t){`
+# 打包产物常为单行，不能用 ^ 锚点（re.M 下 ^ 只匹配文件开头）；模块 id 引号可有可无、4-6 位 hex
 _MODULE_FACTORY_RE = re.compile(
-    r'^\s*"[0-9a-f]+"\s*:\s*function\s*\(\s*e\s*,\s*t\s*,\s*n\s*\)\s*\{',
-    re.M,
+    r'"?([0-9a-f]{4,6})"?\s*:\s*function\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)\s*\{',
 )
 _BRIDGE_MAX_DYN_SITES = 50   # 导出名全局动态调用点超过该值视为"过泛"（如 a），跳过防噪声
 _BRIDGE_MAX_SNIPPETS = 3     # 桥接召回的 caller 段数上限（与下游 [:3] 消费一致）
@@ -849,9 +935,9 @@ def _build_bridge_index(code_bytes: bytes):
         ranges.append((off, end, src[:off].count("\n") + 1))
     exports = []
     for m in _EXPORT_BRIDGE_RE.finditer(src):
-        private_name = m.group(2) or m.group(3)
+        private_name = m.group(3) or m.group(4)
         if private_name:
-            exports.append((m.group(1), private_name, src[:m.start()].count("\n") + 1, m.start()))
+            exports.append((m.group(2), private_name, src[:m.start()].count("\n") + 1, m.start()))
     return {"src": src, "ranges": ranges, "exports": exports}
 
 
@@ -922,8 +1008,8 @@ def _bridge_callers(bridge_index, code_bytes: bytes, wrapper_name: str,
     chain = []
     seen = set()
     for export_name, _, export_ln, _ in scoped:
-        if len(export_name) < 2:
-            continue
+        # 混淆 bundle 中导出名多为单字母（如 "C"/"i"），不能用长度过滤；
+        # 防过泛由下方 _BRIDGE_MAX_DYN_SITES（动态调用点上限）承担。
 
         # 3) 全局动态调用点: Object(a["X"])(t) / a["X"](...) / .X(...)
         dyn_offs = []
@@ -961,7 +1047,9 @@ def _bridge_callers(bridge_index, code_bytes: bytes, wrapper_name: str,
 
 
 def _extract_multiple_apis_from_bytes(code_bytes: bytes, target_apis: list,
-                                      trace: Optional[list] = None) -> Dict[str, Dict[str, Any]]:
+                                      trace: Optional[list] = None,
+                                      bundle_context: Optional[dict] = None
+                                      ) -> Dict[str, Dict[str, Any]]:
     _PARSER = get_parser()
     logger = get_logger()
 
@@ -1176,13 +1264,97 @@ def _extract_multiple_apis_from_bytes(code_bytes: bytes, target_apis: list,
                         ],
                     })
 
+    # ---- 跨 chunk 补充：单 chunk 召回不足时，用全 bundle 索引跨文件召回 ----
+    if bundle_context and isinstance(bundle_context, dict):
+        _cross_chunk_fallback(results, target_apis, bundle_context, trace)
+
     return results
 
 
+def _merge_caller_params(callers):
+    """汇总多个调用点提取到的参数字段名（去重保序）。"""
+    merged = []
+    seen = set()
+    for c in callers:
+        for p in c.get("params", []):
+            if p not in seen:
+                seen.add(p)
+                merged.append(p)
+    return merged
+
+
+def _cross_chunk_fallback(results, target_apis, bundle_context, trace):
+    """对 caller_codes 为空的 API，用跨文件召回补充定义片段与调用方参数。
+    bundle_context: {"chunk_dir", "index", "cross_chunk_recall",
+                     "find_api_callers"(可选), "resolve_export_name"(可选)}"""
+    chunk_dir = bundle_context.get("chunk_dir")
+    index = bundle_context.get("index")
+    recall = bundle_context.get("cross_chunk_recall")
+    find_callers = bundle_context.get("find_api_callers")
+    resolve_export = bundle_context.get("resolve_export_name")
+    if not chunk_dir or not index or not recall:
+        return
+    try:
+        for api in target_apis:
+            rd = results.get(api)
+            if not rd or rd.get("caller_codes"):
+                continue  # 已有调用方，跳过
+
+            # 1) 优先：用 find_api_callers 召回调用方参数（需导出名）
+            if find_callers and resolve_export:
+                export_name = resolve_export(chunk_dir, index, api)
+                if export_name:
+                    cr = find_callers(chunk_dir, index, export_name)
+                    if cr and cr.get("callers"):
+                        rd["caller_codes"] = [c["code"] for c in cr["callers"]]
+                        rd["caller_params"] = _merge_caller_params(cr["callers"])
+                        rd["bundle_chain"] = [
+                            f"{export_name}->{c['file']}" for c in cr["callers"]]
+                        if trace is not None:
+                            trace.append({
+                                "stage": "cross_chunk_callers",
+                                "api": api,
+                                "export": export_name,
+                                "callers": len(cr["callers"]),
+                                "params": rd["caller_params"],
+                            })
+                        continue
+
+            # 2) 退回：cross_chunk_recall 召回定义片段（含 url/method/data 骨架）
+            res = recall(chunk_dir, index, api)
+            if not res or not res.get("snippets"):
+                continue
+            rd["caller_codes"] = [s["code"] for s in res["snippets"]]
+            rd["bundle_chain"] = res.get("chain", [])
+            if trace is not None:
+                trace.append({
+                    "stage": "cross_chunk",
+                    "api": api,
+                    "chain": res.get("chain", []),
+                    "snippets": len(res["snippets"]),
+                })
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"[-] cross_chunk_fallback error: {e}")
+
+
 def extract_multiple_apis_from_raw_code(js_code: str, target_apis: list,
-                                        trace: Optional[list] = None) -> Dict[str, Dict[str, Any]]:
+                                        trace: Optional[list] = None,
+                                        bundle_context: Optional[dict] = None
+                                        ) -> Dict[str, Dict[str, Any]]:
+    """提取多个 API 的上下文。
+
+    bundle_context（可选）：跨 chunk 召回上下文，形如
+      {"chunk_dir": str, "index": dict, "cross_chunk_recall": callable,
+       "find_api_callers": callable(可选), "resolve_export_name": callable(可选)}
+    当单 chunk 召回不足（caller_codes 为空）时，先用 find_api_callers 跨文件召回
+    调用方参数（需 resolve_export_name 提供 api_path->导出名映射），否则退回
+    cross_chunk_recall 召回定义片段。
+    None 时走原逻辑（向后兼容）。
+    """
     if not isinstance(js_code, str) or not isinstance(target_apis, list):
         return {}
     return _extract_multiple_apis_from_bytes(
-        js_code.encode('utf-8', errors='replace'), target_apis, trace)
+        js_code.encode('utf-8', errors='replace'), target_apis, trace,
+        bundle_context)
 
