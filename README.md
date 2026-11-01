@@ -23,6 +23,7 @@
 # 1. Clone the repository
 git clone https://github.com/hmx222/JScanner2.git
 cd JScanner2
+# Python 3.10+ is required (3.8/3.9 are not supported)
 
 # 2. Configure and initialize
 vim setup.sh  # Configure your AI API keys etc
@@ -62,16 +63,15 @@ echo urls.txt | bash run_scan.sh   # or pipe it via stdin
 | Option | Default | Description |
 | --- | --- | --- |
 | `-u`, `--url` | required | Target website URL (must include http/https) |
-| `-H`, `--height` | 2 | Scan depth |
+| `-H`, `--depth` (`--height`) | 2 | Scan depth |
 | `-t`, `--thread_num` | 10 | Concurrent thread count |
 | `-p`, `--proxy` | empty | Proxy, e.g. `http://127.0.0.1:7890` |
 | `-v`, `--visible` | False | Show the browser window (headless by default) |
 | `-fp`, `--findparam` | False | Auto-parse API parameters (recommended) |
 | `-fs`, `--fastscan` | False | Fast-scan mode: HTTP-probe filter before AI analysis (recommended) |
-| `-asir`, `--analyzeSensitiveInfoRex` | False | Collect sensitive info from JS with regex |
 | `-asia`, `--analyzeSensitiveInfoAI` | False | Analyze sensitive info with AI |
 | `-rv`, `--request-validation` | False | Auto-send validation requests after AI analysis |
-| `-nr`, `--no-request` | False | Store AI results only, skip validation requests |
+| `-ar`, `--agent-recall` | False | LLM tool-loop deep recall for missing API context (experimental, high token cost) |
 
 Recommended combination (matches `run_scan.sh` defaults):
 
@@ -83,12 +83,12 @@ python main.py -u https://target.com -H 5 -fp -fs -asia
 
 | File | Purpose |
 | --- | --- |
-| `config/config.py` | AI model endpoint, API keys, whitelist path, memory threshold, Feishu alerts, output paths |
+| `config/config.py` | AI endpoint, whitelist path, memory threshold, Feishu alerts, output paths (secrets come from `.env` / env vars) |
 | `config/models_config.json` | Model list configuration |
 | `config/whiteList.txt` | Whitelisted domains (only whitelisted paths are scanned) |
 | `setup.sh` | One-time setup (API keys, NLTK data download) |
 
-> **Note**: AI features (`-fp` / `-asia`) require a valid API key in `config/config.py`. Scanning still runs without it, but AI features are unavailable.
+> **Note**: AI features (`-fp` / `-asia`) require `JSCANNER_API_KEY` in `.env` (or the environment). Scanning still runs without it, but AI features are unavailable.
 
 ---
 
@@ -196,25 +196,41 @@ analytics.example.com
 
 ## 🤖 Agent Usage Guide
 
-JScanner2 can be driven by AI agents (Trae / Claude / Cursor, etc.). The project ships an **MCP server** at `agent/mcp_server.py` (built on the official FastMCP SDK) that lets agents start scans, poll progress, and fetch results programmatically.
+JScanner2 can be driven by AI agents (Trae / Claude / Cursor, etc.). The project ships a **zero-dependency MCP server** at `agent/mcp_server.py`: a hand-rolled stdio JSON-RPC 2.0 implementation (no FastMCP / no `mcp` SDK) that lets agents start scans, poll progress, and fetch results programmatically.
 
 ### Start the MCP server
 
 ```bash
-# stdio transport (default, for TraeCode / Claude Desktop / MCP clients)
-python agent/mcp_server.py
-
-# HTTP transport (streamable-http)
-python agent/mcp_server.py --transport http --port 9000
+# stdio transport only; run from the project root
+python -m agent.mcp_server
 ```
 
+Client config example (`.trae/mcp.json` / Claude Desktop):
+
+```json
+{
+  "mcpServers": {
+    "jscanner2": {
+      "command": "python",
+      "cwd": "/absolute/path/to/JScanner2",
+      "args": ["-B", "-m", "agent.mcp_server"],
+      "env": {"PYTHONPATH": "/absolute/path/to/JScanner2"}
+    }
+  }
+}
+```
+
+There is no `--transport http --port` option; the server only speaks newline-delimited JSON-RPC over stdin/stdout. Relative paths (`config/whiteList.txt`, `Result/`, `logs/`) are resolved against the project root because the server `chdir`s there on startup.
+
 MCP tools: `jscanner_start_scan`, `jscanner_get_task`, `jscanner_list_tasks`, `jscanner_stop_task`, `jscanner_get_apis`, `jscanner_get_vulnerabilities`, `jscanner_get_sensitive_info`, `jscanner_get_sourcemaps`, `jscanner_get_task_logs`.
+
+`jscanner_start_scan` accepts `agent_recall: true` to enable `-ar`-style deep recall for a task.
 
 ### Agent workflow
 
 1. **Confirm authorization** — only scan targets the user explicitly authorizes.
 2. **Identify the target** — get a concrete URL (with http/https), decide scan depth and options.
-3. **Start the scan** — prefer `-fp -fs` (fast-scan + parameter parsing); add `-asia` / `-asir` when sensitive-info scanning is needed.
+3. **Start the scan** — prefer `-fp -fs` (fast-scan + parameter parsing); add `-asia` for sensitive-info scanning, and `-ar` only when API context recall needs the experimental LLM tool loop.
 4. **Collect results** — query `ai_vulns` (focus on High risk), `sensitive_info`, `js_source_maps`.
 
 ### Operational notes

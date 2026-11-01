@@ -43,10 +43,7 @@ if [ -p /dev/stdin ]; then
 elif [ $# -eq 1 ]; then
     URL_FILE="$1"
 else
-    echo -e "\033[31m❌ 错误：请使用正确方式运行！\033[0m"
-    echo -e "\033[32m✅ 方式1: echo urls.txt | $0\033[0m"
-    echo -e "\033[32m✅ 方式2: $0 urls.txt\033[0m"
-    exit 1
+    echo -e "\n\033[33mℹ️  未配置飞书 Webhook，跳过最终通知。\033[0m"
 fi
 
 # 校验文件是否存在
@@ -259,5 +256,9 @@ JSON_CONTENT=$(cat <<EOF
 EOF
 )
 
-curl -X POST -H "Content-Type: application/json" -d "${JSON_CONTENT}" "${FEISHU_URL}" >/dev/null 2>&1
-echo -e "\n\033[32m📨 最终通知已发送至飞书。\033[0m"
+if [ -n "${FEISHU_URL}" ]; then
+    curl -X POST -H "Content-Type: application/json" -d "${JSON_CONTENT}" "${FEISHU_URL}" >/dev/null 2>&1
+    echo -e "\n\033[32m📨 最终通知已发送至飞书。\033[0m"
+else
+    echo -e "\n\033[33mℹ️  未配置飞书 Webhook，跳过最终通知。\033[0m"
+fi

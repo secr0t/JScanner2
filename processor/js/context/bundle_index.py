@@ -839,7 +839,8 @@ def _expr_body_end(src: str, expr_start: int, max_scan: int = 20000):
     return None
 
 
-def resolve_export_name(chunk_dir: str, index: dict, api_path: str):
+def resolve_export_name(chunk_dir: str, index: dict, api_path: str,
+                        with_module: bool = False):
     """反查 API 路径对应的导出函数名（跨 chunk）。
 
     逻辑（与 _build_bridge_index 一致）：
@@ -849,8 +850,19 @@ def resolve_export_name(chunk_dir: str, index: dict, api_path: str):
          关键：用花括号配平验证该函数体的闭合 `}` 落在 api_path 之后，
          从而避免在大模块内命中前一个函数导致错位。
       3. 用 _EXPORT_BRIDGE_RE 反查该变量对应的导出名。
-    返回导出名（str）或 None。大模块内多 API 时仍可能错位，调用方可人工校正。
+    返回导出名（str）或 None；with_module=True 时返回 (导出名, 定义模块 id)，
+    模块 id 供 find_api_callers(def_module_id=...) 收窄单字母导出名的搜索范围。
+    大模块内多 API 时仍可能错位，调用方可人工校正。
     """
+    cache = index.setdefault("_resolve_cache", {})
+    cache_key = (api_path, with_module)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    def _ret(value):
+        cache[cache_key] = value
+        return value
+
     for fn in sorted(index["files"]):
         src = _read_file_src(chunk_dir, fn)
         if src is None:
@@ -929,9 +941,9 @@ def resolve_export_name(chunk_dir: str, index: dict, api_path: str):
             bundler = index["files"][fn].get("bundler", "unknown")
             for _, export_name, private_name in _export_offsets(bundler, mod_src):
                 if private_name == var:
-                    return export_name
-            return None
-    return None
+                    return _ret((export_name, owner) if with_module else export_name)
+            return _ret(None)
+    return _ret(None)
 
 
 def _api_def_snippet(src: str, api_off: int):
@@ -1144,6 +1156,10 @@ def _file_imports_module(src: str, mod_id: str) -> bool:
     """
     if not mod_id:
         return True
+    # 数字/十六进制模块 id 也可能是裸字面量：`t(0d85)`（webpack4 常见）
+    if re.fullmatch(r'[0-9a-fA-F]{1,8}', mod_id) and re.search(
+            r'\(\s*' + re.escape(mod_id) + r'\s*\)', src):
+        return True
     needle = '"' + mod_id + '"'
     start = 0
     while True:
@@ -1166,42 +1182,46 @@ def _module_bind_vars(src: str, mod_id: str):
       - `var a=n("mod")` / `a=n("mod")` / `const a=n.n("mod")`
       - 逗号表达式：`_e=(c("ab43"),c("4af0"))`（RHS 为 `(X("m1"),X("mod"))`）
       - 直接调用：`a=o("mod")`（无 var/const/let 前缀）
+      - 数字/十六进制 id 的裸调用：`var n=t(0d85)`
     用于 find_api_callers 精确限定：仅匹配 `a["export"]`（a 为绑定变量），
     避免同文件内其它命名空间（w/s/o 等）的同名单字母导出造成误报。
     """
     if not mod_id:
         return []
-    # 用字符串 find 定位 `"mod_id"`，再向前解析绑定变量，
-    # 避免对超大单行 webpack 产物做慢速正则 findall（贪婪回溯）。
+
+    # 1) 收集 `X("mod")` / `X(0d85)` 调用：记录左括号位置与调用结束位置
+    calls = []
     needle = '"' + mod_id + '"'
-    vars_ = []
     start = 0
     while True:
         idx = src.find(needle, start)
         if idx == -1:
             break
-        # 向前找 `X("mod_id")`：`(` 前的标识符 X
         j = idx - 1
         while j >= 0 and src[j] in ' \t\n\r':
             j -= 1
         if j >= 0 and src[j] == '(':
-            # 提取调用函数名 X（可含 `.`，如 `n.n("mod")`），再向前找绑定变量
-            k = j - 1
-            while k >= 0 and (src[k].isalnum() or src[k] in '_$.'):
-                k -= 1
-            # 向前找 `var X =` / `X =` / `(X("m1"),X("mod"))`
-            # seg 覆盖到 `"mod_id")` 之后，确保正则能匹配完整的 `X("mod_id")`
-            seg = src[max(0, k - 80):idx + len(needle) + 2]
-            # 形态1/3：`var X =` 或 `X =`（含逗号表达式 `_e=(c("m1"),X("mod"))`）
-            m = re.search(
-                r'(?:var\s+|const\s+|let\s+)?([A-Za-z_$][\w$]*)\s*=\s*'
-                r'(?:\(\s*[^()]*\s*)?[A-Za-z_$][\w$]*\s*\(\s*["\']'
-                + re.escape(mod_id) + r'["\']\s*\)',
-                seg,
-            )
-            if m:
-                vars_.append(m.group(1))
+            calls.append((j, idx + len(needle) + 1))
         start = idx + 1
+    if re.fullmatch(r'[0-9a-fA-F]{1,8}', mod_id):
+        for m in re.finditer(r'\(\s*' + re.escape(mod_id) + r'\s*\)', src):
+            calls.append((m.start(), m.end()))
+
+    vars_ = []
+    id_pat = r'["\']?' + re.escape(mod_id) + r'["\']?'
+    for open_paren, end_pos in calls:
+        # 向前提取调用函数名 X（可含 `.`，如 `n.n("mod")`），再截取绑定表达式
+        k = open_paren - 1
+        while k >= 0 and (src[k].isalnum() or src[k] in '_$.'):
+            k -= 1
+        seg = src[max(0, k - 80):end_pos]
+        m = re.search(
+            r'(?:var\s+|const\s+|let\s+)?([A-Za-z_$][\w$]*)\s*=\s*'
+            r'(?:\(\s*[^()]*\s*)?[A-Za-z_$][\w$]*\s*\(\s*' + id_pat + r'\s*\)',
+            seg,
+        )
+        if m:
+            vars_.append(m.group(1))
     return list(dict.fromkeys(vars_))
 
 
@@ -1439,6 +1459,11 @@ def cross_chunk_recall(chunk_dir: str, index: dict, api_path: str,
     """跨文件召回：给定 API 路径，找出定义它的模块，并提取关键片段。
     返回 {snippets: [{file, kind, module, code}], chain: [...]}
     kind: api_def（具体 API 定义）/ module_def（模块头）"""
+    cache = index.setdefault("_recall_cache", {})
+    cache_key = (api_path, max_snippets)
+    if cache_key in cache:
+        return cache[cache_key]
+
     snippets = []
     chain = []
     seen = set()
@@ -1484,6 +1509,10 @@ def cross_chunk_recall(chunk_dir: str, index: dict, api_path: str,
                     })
 
             if len(snippets) >= max_snippets:
-                return {"snippets": snippets[:max_snippets], "chain": chain}
+                result = {"snippets": snippets[:max_snippets], "chain": chain}
+                cache[cache_key] = result
+                return result
 
-    return {"snippets": snippets[:max_snippets], "chain": chain}
+    result = {"snippets": snippets[:max_snippets], "chain": chain}
+    cache[cache_key] = result
+    return result

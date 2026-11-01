@@ -1,5 +1,4 @@
 import argparse
-import re
 
 
 def str_to_float(value):
@@ -13,19 +12,6 @@ def str_to_float(value):
         raise argparse.ArgumentTypeError("必须输入有效的浮点数")
 
 
-def parse_headers(header_str):
-    """解析请求头字符串为字典"""
-    # 支持单引号/双引号包裹的键值对，格式如'key':'value'或"key":"value"
-    pattern = r"['\"]([^'\"]+)['\"]:['\"]([^'\"]+)['\"]"
-    matches = re.findall(pattern, header_str)
-
-    headers = {}
-    for key, value in matches:
-        headers[key.strip()] = value.strip()
-
-    return headers
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="网站扫描工具 - 支持URL扫描、批量处理及结果导出")
 
@@ -33,7 +19,8 @@ def parse_args():
     parser.add_argument('-u', '--url', type=lambda x: x.strip().rstrip('\r'),
                         help="输入带有http/https的单个网站URL（如：https://example.com）")
     # 扫描配置参数
-    parser.add_argument('-H', '--height', type=int, default=2, help="扫描深度（默认：2）")
+    parser.add_argument('-H', '--depth', '--height', dest='height', type=int, default=2,
+                        help="扫描深度（默认：2；-H/--depth 推荐，--height 为兼容别名）")
     parser.add_argument('-t', '--thread_num', type=int, default=10, help="并发线程数（默认：10）")
 
     # 网络与浏览器参数
@@ -43,8 +30,6 @@ def parse_args():
     parser.add_argument('-v', '--visible', action='store_true', default=False,
                         help="显示浏览器窗口（默认：无头模式，不显示窗口）")
 
-    parser.add_argument('-asir','--analyzeSensitiveInfoRex', default=False, action='store_true',help="是否利用正则表达式收集JS敏感信息")
-
     parser.add_argument('-fp', '--findparam', action='store_true', default=False,
                         help="自动解析api参数")
 
@@ -52,12 +37,17 @@ def parse_args():
 
     parser.add_argument('-asia','--analyzeSensitiveInfoAI', action='store_true', default=False, help="是否使用AI模型分析敏感信息")
 
-    parser.add_argument('-nr', '--no-request', action='store_true', default=False,
-                        help="禁止自动发起验证请求，仅保存AI分析结果到数据库")
-
     parser.add_argument('-rv', '--request-validation', action='store_true', default=False,
                         help="AI分析完成后，自动发起请求验证结果")
 
+    # Agent 召回（主动决策式深召回，LLM 密集，默认关闭）
+    parser.add_argument('-ar', '--agent-recall', action='store_true', default=False,
+                        help="启用 Agent 召回：普通/跨chunk召回不足时，用 LLM 工具循环深度召回补充上下文")
+
     args = parser.parse_args()
+
+    # 无目标时不要静默跑空扫描：明确报错并以退出码 2 结束（argparse 约定）
+    if not (args.url and args.url.strip()):
+        parser.error("必须提供扫描目标：-u/--url https://example.com")
 
     return args

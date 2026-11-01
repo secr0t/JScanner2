@@ -184,6 +184,48 @@ async def collect_chunks(base_url: str, chunk_dir: str,
             "downloaded": downloaded, "failed": failed}
 
 
+async def append_js_urls(chunk_dir: str, js_urls, fetch_urls_async=None,
+                         thread_num=50, headers=None, cookies=None, timeout=30):
+    """把尚未落盘的 JS URL 追加到已有 chunk 目录。
+
+    同站点共享一个 chunk_dir 时，后续批次新出现的 JS 需要补下载，
+    否则共享索引会漏掉这些文件（跨 chunk 召回覆盖不全）。
+    已存在同名文件的 URL 会跳过，不重复下载。
+    """
+    urls = [u for u in (js_urls or []) if u]
+    if not urls:
+        return {"downloaded": 0, "failed": 0}
+
+    os.makedirs(chunk_dir, exist_ok=True)
+    if fetch_urls_async is None:
+        from crawler.httpx_crawler import fetch_urls_async
+
+    pending = []
+    for u in urls:
+        name = os.path.basename(u.split("?")[0])
+        if name.endswith(".js") and not os.path.exists(os.path.join(chunk_dir, name)):
+            pending.append(u)
+    if not pending:
+        return {"downloaded": 0, "failed": 0}
+
+    results = await fetch_urls_async(
+        pending, thread_num=thread_num, headers=headers,
+        cookies=cookies, timeout=timeout)
+    downloaded = 0
+    failed = 0
+    for res in results:
+        if res.get("error") or not res.get("response_content"):
+            failed += 1
+            continue
+        name = os.path.basename(res["url"].split("?")[0])
+        if not name.endswith(".js"):
+            continue
+        with open(os.path.join(chunk_dir, name), "w", encoding="utf-8") as f:
+            f.write(res["response_content"])
+        downloaded += 1
+    return {"downloaded": downloaded, "failed": failed}
+
+
 def collect_chunks_sync(base_url: str, chunk_dir: str, **kwargs):
     """同步包装：方便非 async 环境调用"""
     return asyncio.run(collect_chunks(base_url, chunk_dir, **kwargs))

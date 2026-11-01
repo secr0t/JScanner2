@@ -383,15 +383,6 @@ class DuplicateChecker:
             return False
         return ApiStatus.should_retry(status, state.get("attempt_count", 0))
 
-    def is_api_path_processed(self, api_path: str) -> bool:
-        """
-        【兼容旧接口】是否真正分析完成（只有 VALIDATED 算完成）
-        """
-        state = self.get_api_state(api_path)
-        if not state:
-            return False
-        return ApiStatus.is_terminal_success(state.get("status"))
-
     def mark_apis_discovered(self, paths_data: list):
         """
         登记发现的 API（状态 = DISCOVERED，不代表处理完成）

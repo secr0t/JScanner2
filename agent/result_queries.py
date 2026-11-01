@@ -8,7 +8,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import time
 from typing import Any, Dict, List, Optional
 
 from .schemas import TaskInfo, TaskStatus
@@ -28,17 +31,38 @@ def _get_db_path(task: TaskInfo) -> Optional[str]:
 
 def _open_db(db_path: str):
     """
-    打开只读 DB 连接。
+    以只读方式打开数据库。
 
-    复用项目的 SQLiteStorage，但以只读模式打开（不触发迁移/建表）。
+    不建表、不跑迁移；库不存在或只读打开失败时由调用方按空结果处理。
     """
     from storage.db import SQLiteStorage
 
     if not os.path.exists(db_path):
         return None
-    # SQLiteStorage.__init__ 会执行 _init_db（建表 + 迁移）。
-    # 对已存在的库，IF NOT EXISTS / 空迁移是安全的幂等操作。
-    return SQLiteStorage(db_path)
+    try:
+        return SQLiteStorage(db_path, read_only=True)
+    except Exception:
+        return None
+
+
+def _task_scan_id(task: TaskInfo) -> Optional[str]:
+    """由任务 URL 推导站点 scan_id（与扫描主流程同一规则）。
+
+    直接复用 tldextract，避免 import processor.analysis 触发 AI 客户端的重副作用。
+    """
+    try:
+        from urllib.parse import urlparse
+
+        import tldextract
+
+        from storage.db import SQLiteStorage
+
+        host = urlparse(task.url or "").netloc
+        ext = tldextract.extract(host)
+        root = f"{ext.domain}.{ext.suffix}" if ext.suffix else host
+        return SQLiteStorage._scan_id_for_domain(root)
+    except Exception:
+        return None
 
 
 def _try_query(task: TaskInfo, query_fn) -> Any:
@@ -79,7 +103,8 @@ def get_apis(task: TaskInfo, page: int = 1, page_size: int = 20,
         status_filter: 按状态过滤（DISCOVERED / AI_DONE / VALIDATED 等）
     """
     def _query(db):
-        states = db.get_api_states(statuses=[status_filter] if status_filter else None)
+        states = db.get_api_states(scan_id=_task_scan_id(task),
+                                   statuses=[status_filter] if status_filter else None)
         total = len(states)
         start = (page - 1) * page_size
         end = start + page_size
@@ -100,7 +125,7 @@ def get_vulnerabilities(task: TaskInfo, risk_level: Optional[str] = None,
         limit: 最多返回条数
     """
     def _query(db):
-        vulns = db.get_all_vulns(risk_filter=risk_level)
+        vulns = db.get_all_vulns(risk_filter=risk_level, scan_id=_task_scan_id(task))
         total = len(vulns)
         items = vulns[:limit]
         return {"total": total, "limit": limit, "items": items}
@@ -142,7 +167,7 @@ def get_sourcemaps(task: TaskInfo) -> Dict[str, Any]:
 def get_task_stats(task: TaskInfo) -> Dict[str, Any]:
     """拉取任务的全量统计摘要。"""
     def _query(db):
-        stats = db.get_stats()
+        stats = db.get_stats(scan_id=_task_scan_id(task))
         # 简化嵌套结构
         return {
             "ai_vulns_total": stats.get("ai_vulns", {}).get("total", 0),
@@ -157,12 +182,69 @@ def get_task_stats(task: TaskInfo) -> Dict[str, Any]:
     return _try_query(task, _query)
 
 
+# ---------------------------------------------------------------------------
+# 进度阶段（watchdog 心跳）
+# ---------------------------------------------------------------------------
+
+_HEARTBEAT_PHASE_MAP = {
+    "startup": "startup",
+    "init": "startup",
+    "page_done": "crawling",
+    "batch": "crawling",
+    "ai_call": "ai_analysis",
+    "ai_done": "ai_analysis",
+    "ai_batch": "ai_analysis",
+    "param_l3": "ai_analysis",
+    "sensitive_loop": "sensitive",
+    "secret_scan": "sensitive",
+    "secret_format": "sensitive",
+    "secret_llm": "sensitive",
+}
+
+
+def _apply_heartbeat_phase(task: TaskInfo) -> None:
+    """从 watchdog 心跳推导当前阶段。
+
+    仅对 RUNNING 任务生效，且要求心跳属于当前进程、60 秒内，避免读到上一轮
+    扫描遗留的 "finished" 把新任务误标成已完成。
+    """
+    if task.status != TaskStatus.RUNNING:
+        return
+    path = os.environ.get("JSCANNER_HEARTBEAT", "Result/heartbeat.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            hb = json.load(f)
+    except Exception:
+        return
+    if hb.get("pid") != os.getpid():
+        return
+    try:
+        if time.time() - float(hb.get("last_beat_epoch") or 0) > 60:
+            return
+    except (TypeError, ValueError):
+        return
+
+    phase = _HEARTBEAT_PHASE_MAP.get(hb.get("phase") or "")
+    if phase:
+        task.phase = phase
+    detail = hb.get("detail") or ""
+    m = re.search(r"\bD(\d+)\b", detail)
+    if m:
+        task.depth = int(m.group(1))
+    m = re.search(r"(\d+)/(\d+)", detail)
+    if m:
+        task.current_batch = int(m.group(1))
+        task.total_batches = int(m.group(2))
+
+
 def refresh_task_progress(task: TaskInfo) -> None:
     """
     从 DB 查询最新统计，更新 TaskInfo 的进度字段。
 
     在 TaskManager 轮询进度时调用。
     """
+    _apply_heartbeat_phase(task)
+
     db_path = _get_db_path(task)
     if not db_path or not os.path.exists(db_path):
         return
@@ -172,7 +254,7 @@ def refresh_task_progress(task: TaskInfo) -> None:
         if db is None:
             return
         try:
-            stats = db.get_stats()
+            stats = db.get_stats(scan_id=_task_scan_id(task))
 
             task.urls_found = stats.get("scan_results", {}).get("total_urls", 0)
             task.vulns_count = stats.get("ai_vulns", {}).get("total", 0)

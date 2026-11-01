@@ -23,6 +23,7 @@
 # 1. 克隆项目
 git clone https://github.com/hmx222/JScanner2.git
 cd JScanner2
+# 需要 Python 3.10+（3.8/3.9 不受支持）
 
 # 2. 初始化配置
 vim setup.sh  # 配置AI API密钥等
@@ -62,16 +63,15 @@ echo urls.txt | bash run_scan.sh   # 或通过管道输入
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-u`, `--url` | 必填 | 目标网站 URL（需含 http/https） |
-| `-H`, `--height` | 2 | 扫描深度 |
+| `-H`, `--depth`（`--height`） | 2 | 扫描深度 |
 | `-t`, `--thread_num` | 10 | 并发线程数 |
 | `-p`, `--proxy` | 空 | 代理，如 `http://127.0.0.1:7890` |
 | `-v`, `--visible` | False | 显示浏览器窗口（默认无头模式） |
 | `-fp`, `--findparam` | False | 自动解析 API 参数（推荐开启） |
 | `-fs`, `--fastscan` | False | 快速扫描模式：先 HTTP 探测过滤再送 AI（推荐开启） |
-| `-asir`, `--analyzeSensitiveInfoRex` | False | 正则收集 JS 敏感信息 |
 | `-asia`, `--analyzeSensitiveInfoAI` | False | AI 分析敏感信息 |
 | `-rv`, `--request-validation` | False | AI 分析后自动发起请求验证 |
-| `-nr`, `--no-request` | False | 仅存档 AI 结果，不发验证请求 |
+| `-ar`, `--agent-recall` | False | LLM 工具循环深度召回缺失的 API 上下文（实验特性，token 消耗高） |
 
 推荐组合（与 `run_scan.sh` 默认一致）：
 
@@ -83,12 +83,12 @@ python main.py -u https://target.com -H 5 -fp -fs -asia
 
 | 文件 | 作用 |
 | --- | --- |
-| `config/config.py` | AI 模型地址、API Key、白名单路径、内存阈值、飞书告警、输出路径 |
+| `config/config.py` | AI 模型地址、白名单路径、内存阈值、飞书告警、输出路径（密钥来自 `.env` / 环境变量） |
 | `config/models_config.json` | 模型列表配置 |
 | `config/whiteList.txt` | 白名单域名（仅扫描白名单路径） |
 | `setup.sh` | 初始化（配置 API Key、下载 NLTK 数据） |
 
-> **注意**：AI 相关功能（`-fp` / `-asia`）依赖 `config/config.py` 中配置有效的 API Key。未配置时扫描仍可运行，但 AI 功能不可用。
+> **注意**：AI 相关功能（`-fp` / `-asia`）依赖 `.env`（或环境变量 `JSCANNER_API_KEY`）中的有效 API Key。未配置时扫描仍可运行，但 AI 功能不可用。
 
 ---
 
@@ -196,25 +196,41 @@ analytics.example.com
 
 ## 🤖 Agent 使用指南
 
-JScanner2 可被 AI Agent（Trae / Claude / Cursor 等）以编程方式调用。项目内置 **MCP Server**（`agent/mcp_server.py`，基于官方 FastMCP SDK），让 Agent 可以发起扫描、轮询进度、拉取结果。
+JScanner2 可被 AI Agent（Trae / Claude / Cursor 等）以编程方式调用。项目内置 **零依赖 MCP Server**（`agent/mcp_server.py`）：手写 stdio + JSON-RPC 2.0，不使用 FastMCP / `mcp` SDK，让 Agent 可以发起扫描、轮询进度、拉取结果。
 
 ### 启动 MCP Server
 
 ```bash
-# stdio 传输（默认，供 TraeCode / Claude Desktop 等 MCP 客户端接入）
-python agent/mcp_server.py
-
-# HTTP 传输（streamable-http）
-python agent/mcp_server.py --transport http --port 9000
+# 仅支持 stdio；在项目根目录执行
+python -m agent.mcp_server
 ```
 
+客户端配置示例（`.trae/mcp.json` / Claude Desktop）：
+
+```json
+{
+  "mcpServers": {
+    "jscanner2": {
+      "command": "python",
+      "cwd": "/absolute/path/to/JScanner2",
+      "args": ["-B", "-m", "agent.mcp_server"],
+      "env": {"PYTHONPATH": "/absolute/path/to/JScanner2"}
+    }
+  }
+}
+```
+
+没有 `--transport http --port` 参数；服务只通过 stdin/stdout 收发逐行 JSON-RPC。启动时会 `chdir` 到项目根目录，因此 `config/whiteList.txt`、`Result/`、`logs/` 等相对路径都以项目根为基准。
+
 MCP 工具：`jscanner_start_scan`、`jscanner_get_task`、`jscanner_list_tasks`、`jscanner_stop_task`、`jscanner_get_apis`、`jscanner_get_vulnerabilities`、`jscanner_get_sensitive_info`、`jscanner_get_sourcemaps`、`jscanner_get_task_logs`。
+
+`jscanner_start_scan` 支持 `agent_recall: true`，等价于 CLI 的 `-ar` 深度召回。
 
 ### Agent 使用工作流
 
 1. **确认授权**：只扫描用户明确授权/有权限的目标。
 2. **明确目标**：拿到具体 URL（带 http/https），确定扫描深度与参数。
-3. **发起扫描**：优先推荐 `-fp -fs`（快速 + 参数解析）；需要敏感信息时加 `-asia` 或 `-asir`。
+3. **发起扫描**：优先推荐 `-fp -fs`（快速 + 参数解析）；需要敏感信息时加 `-asia`；只有需要实验性的 LLM 工具循环深召回时才加 `-ar`。
 4. **查看结果**：查询 `ai_vulns`（重点 High 风险）、`sensitive_info`、`js_source_maps`。
 
 ### 注意事项

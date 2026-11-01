@@ -2022,6 +2022,7 @@ class AISecurityAuditor:
         api_paths: list,
         target_url: str,
         bundle_context: Optional[dict] = None,
+        agent_recall: bool = False,
     ) -> Dict[
         str,
         Optional[Dict[str, Any]]
@@ -2042,6 +2043,9 @@ class AISecurityAuditor:
              "find_api_callers": callable, "resolve_export_name": callable}
         传入后，对 caller_codes 为空的 API 会用跨文件召回补充定义片段与调用方参数
         （不依赖 AI）。None 时保持原单文件召回行为。
+
+        agent_recall（可选）：为 True 时，普通/跨chunk召回仍不足的 API 会用
+        LLM 工具循环（RecallAgent）深度召回补充上下文（LLM 密集，默认关闭）。
         """
 
         results = {}
@@ -2074,6 +2078,7 @@ class AISecurityAuditor:
                     js_code,
                     api_paths,
                     bundle_context=bundle_context,
+                    agent_recall=agent_recall,
                 )
             )
 

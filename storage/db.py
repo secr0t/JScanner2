@@ -39,17 +39,55 @@ VERDICT_TO_RISK = {
 # 本扫描器关注的核心问题：接口未授权访问
 DEFAULT_VULNERABILITY_TYPE = "unauthorized_access"
 
+# 重扫写入 AI 结果：冲突时只更新 AI 侧字段，保留请求验证结论与首次创建时间。
+_AI_VULNS_UPSERT_SQL = """
+    INSERT INTO ai_vulns
+    (js_url, api_endpoint, http_method, path, params,
+     risk_level, vulnerability_type, evidence, scan_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(js_url, api_endpoint) DO UPDATE SET
+        http_method = excluded.http_method,
+        path = excluded.path,
+        params = excluded.params,
+        vulnerability_type = excluded.vulnerability_type,
+        evidence = excluded.evidence,
+        scan_id = COALESCE(excluded.scan_id, ai_vulns.scan_id),
+        risk_level = CASE
+            WHEN ai_vulns.request_status IS NOT NULL AND ai_vulns.request_status != ''
+                THEN ai_vulns.risk_level
+            ELSE excluded.risk_level
+        END
+"""
+
 
 class SQLiteStorage:
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, read_only: bool = False):
         db_dir = os.path.dirname(os.path.abspath(db_path))
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
 
         self.db_path = db_path
+        self.read_only = read_only
         self.conn: Optional[sqlite3.Connection] = None
+        if read_only:
+            self._open_read_only()
+            return
         self._init_db()
+
+    def _open_read_only(self):
+        """只读打开已存在的库：不建表、不迁移、不写 WAL。"""
+        if not os.path.exists(self.db_path):
+            raise FileNotFoundError(self.db_path)
+        path = os.path.abspath(self.db_path).replace("\\", "/")
+        if path.startswith("//"):
+            uri = "file:" + path          # UNC 路径
+        elif path.startswith("/"):
+            uri = "file://" + path
+        else:
+            uri = "file:///" + path       # Windows 盘符路径
+        self.conn = sqlite3.connect(uri + "?mode=ro", uri=True, check_same_thread=False)
+        self.conn.execute("PRAGMA query_only=ON;")
 
     def _init_db(self):
         """初始化数据库：开启 WAL 模式以获得极速写入性能"""
@@ -735,32 +773,32 @@ class SQLiteStorage:
             logger.warning(f"⚠️ [DB] 读取 API 状态失败：{e}")
             return None
 
-    def get_api_states(self, scan_id: str, statuses: List[str] = None) -> List[Dict[str, Any]]:
-        """读取某站点全部（或指定状态）的 API 状态记录"""
-        if not scan_id:
-            return []
+    def get_api_states(self, scan_id: str = None, statuses: List[str] = None) -> List[Dict[str, Any]]:
+        """读取 API 状态记录。
+
+        scan_id 为 None 时读取全表（任务级 DB 只有一个 scan_id；MCP 结果查询
+        走这条路径）；statuses 可选，用于按状态过滤。
+        """
         try:
             cursor = self.conn.cursor()
+            clauses: List[str] = []
+            params: List[Any] = []
+            if scan_id:
+                clauses.append("scan_id = ?")
+                params.append(scan_id)
             if statuses:
                 placeholders = ",".join("?" * len(statuses))
-                cursor.execute(
-                    f"""
-                    SELECT scan_id, api_path, js_url, status, attempt_count,
-                           last_error, run_id, created_at, updated_at
-                    FROM api_analysis_state
-                    WHERE scan_id = ? AND status IN ({placeholders})
-                    """,
-                    [scan_id] + list(statuses),
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT scan_id, api_path, js_url, status, attempt_count,
-                           last_error, run_id, created_at, updated_at
-                    FROM api_analysis_state WHERE scan_id = ?
-                    """,
-                    (scan_id,),
-                )
+                clauses.append(f"status IN ({placeholders})")
+                params.extend(statuses)
+            where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor.execute(
+                f"""
+                SELECT scan_id, api_path, js_url, status, attempt_count,
+                       last_error, run_id, created_at, updated_at
+                FROM api_analysis_state{where}
+                """,
+                params,
+            )
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
         except Exception as e:
@@ -996,14 +1034,7 @@ class SQLiteStorage:
             cursor = self.conn.cursor()
             row = self._build_ai_row(advisory_report, scan_id)
 
-            sql = """
-                INSERT OR REPLACE INTO ai_vulns
-                (js_url, api_endpoint, http_method, path, params,
-                 risk_level, vulnerability_type, evidence, scan_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
-
-            cursor.execute(sql, (js_url, api_endpoint) + row)
+            cursor.execute(_AI_VULNS_UPSERT_SQL, (js_url, api_endpoint) + row)
 
             self.conn.commit()
 
@@ -1029,18 +1060,17 @@ class SQLiteStorage:
             cursor = self.conn.cursor()
             row = self._build_ai_row(advisory_report, scan_id)
 
-            sql = """
-                INSERT OR REPLACE INTO ai_vulns
-                (js_url, api_endpoint, http_method, path, params,
-                 risk_level, vulnerability_type, evidence, scan_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
+            cursor.execute(_AI_VULNS_UPSERT_SQL, (js_url, full_url) + row)
 
-            cursor.execute(sql, (js_url, full_url) + row)
+            # UPSERT 的 UPDATE 分支不会更新 lastrowid，显式回查记录 ID
+            cursor.execute(
+                "SELECT id FROM ai_vulns WHERE js_url = ? AND api_endpoint = ?",
+                (js_url, full_url),
+            )
+            rec = cursor.fetchone()
+            record_id = rec[0] if rec else None
 
             self.conn.commit()
-
-            record_id = cursor.lastrowid
 
             logger.info(f"💾 [DB] 渗透建议已存档：{row[0]} {full_url}")
 
@@ -1140,10 +1170,17 @@ class SQLiteStorage:
             cursor.execute("BEGIN TRANSACTION;")
 
             sql = """
-                INSERT OR REPLACE INTO sensitive_info
+                INSERT INTO sensitive_info
                 (js_url, sensitive_value, context_code, caller_codes, risk_level,
                  secret_type, test_suggestion, ai_raw_analysis)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(js_url, sensitive_value) DO UPDATE SET
+                    context_code = excluded.context_code,
+                    caller_codes = excluded.caller_codes,
+                    risk_level = excluded.risk_level,
+                    secret_type = excluded.secret_type,
+                    test_suggestion = excluded.test_suggestion,
+                    ai_raw_analysis = excluded.ai_raw_analysis
             """
 
             inserted_count = 0
@@ -1306,15 +1343,22 @@ class SQLiteStorage:
             return {}
 
 
-    def get_all_vulns(self, risk_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_all_vulns(self, risk_filter: Optional[str] = None,
+                      scan_id: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
             cursor = self.conn.cursor()
+            clauses = []
+            params: List[Any] = []
             if risk_filter:
-                sql = "SELECT * FROM ai_vulns WHERE risk_level = ? ORDER BY created_at DESC"
-                cursor.execute(sql, (risk_filter,))
-            else:
-                sql = "SELECT * FROM ai_vulns ORDER BY created_at DESC"
-                cursor.execute(sql)
+                clauses.append("risk_level = ?")
+                params.append(risk_filter)
+            if scan_id:
+                clauses.append("scan_id = ?")
+                params.append(scan_id)
+            where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor.execute(
+                "SELECT * FROM ai_vulns" + where + " ORDER BY created_at DESC", params
+            )
 
             columns = [desc[0] for desc in cursor.description]
             results = []
@@ -1373,14 +1417,24 @@ class SQLiteStorage:
             logger.error(f"❌ [DB] 按端点读取失败：{e}")
             return None
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self, scan_id: str = None) -> Dict[str, Any]:
+        """全局/单站点统计。
+
+        scan_id 非空时，ai_vulns 与 api_analysis_state 按站点过滤；
+        sensitive_info / scan_results / visited_urls 没有 scan_id 列，仍为全库统计。
+        """
         try:
             cursor = self.conn.cursor()
+            vuln_where = " WHERE scan_id = ?" if scan_id else ""
+            vuln_params = (scan_id,) if scan_id else ()
 
-            cursor.execute("SELECT COUNT(*) FROM ai_vulns")
+            cursor.execute("SELECT COUNT(*) FROM ai_vulns" + vuln_where, vuln_params)
             total_vulns = cursor.fetchone()[0]
 
-            cursor.execute("SELECT risk_level, COUNT(*) FROM ai_vulns GROUP BY risk_level")
+            cursor.execute(
+                "SELECT risk_level, COUNT(*) FROM ai_vulns" + vuln_where + " GROUP BY risk_level",
+                vuln_params,
+            )
             risk_distribution_vulns = dict(cursor.fetchall())
 
             cursor.execute("SELECT COUNT(*) FROM sensitive_info")
@@ -1415,7 +1469,7 @@ class SQLiteStorage:
                     "total": total_visited
                 },
                 "api_analysis_state": {
-                    "by_status": self.get_api_state_stats()
+                    "by_status": self.get_api_state_stats(scan_id)
                 }
             }
         except Exception as e:

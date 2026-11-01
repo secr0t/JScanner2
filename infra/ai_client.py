@@ -11,7 +11,7 @@ from typing import List, Optional, Dict, Any
 import json_repair
 from openai import OpenAI, APIConnectionError, APIStatusError, RateLimitError, APITimeoutError
 
-from config.config import BASE_URL, API_KEY, ENABLE_PROMPT_CACHE, CACHE_CONTROL_TYPE, MIN_CACHE_TOKENS, MAX_CACHE_MARKERS
+from config.config import BASE_URL, API_KEY
 from infra import watchdog
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -131,6 +131,10 @@ class AIHubClient:
             pass
 
         self._models = models or []
+        if not self._models:
+            raise ValueError(
+                "AIHubClient 未配置任何模型：请检查 config/models_config.json 的 models 列表"
+            )
         self._model_statuses = [ModelStatus(model_name=m) for m in self._models]
         self._lock = threading.Lock()
 

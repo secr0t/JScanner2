@@ -34,7 +34,10 @@ try:
         from js_formatter import format_code
 except ImportError as e:
     sys.stderr.write(f"⚠️  Missing dependency: {e}\n")
-    sys.exit(1)
+    # 不要在这里直接退出进程：调用方（MCP/服务层/测试）需要能捕获并决定是否降级
+    raise ImportError(
+        f"secret_scanner 缺少可选依赖（wordninja/nltk/js_formatter）：{e}"
+    )
 
 
 def _init_nltk_offline():
@@ -375,6 +378,17 @@ class SensitiveInfoScanner:
         self.ast_available = SenInfoContextExtractor is not None
         self._local_logger = get_logger("SensitiveInfoScanner")
 
+        # 去重过滤器是磁盘级的、生命周期长于 DB：新库为空时重置，避免旧记录
+        # 把本应写入新库的候选/输出全部压掉（sensitive_info 恒为 0 的根因之一）。
+        if db is not None:
+            try:
+                if not db.get_all_sensitive():
+                    _AI_CANDIDATE_DEDUP.clear()
+                    _OUTPUT_LINE_DEDUP.clear()
+                    self._local_logger.info("🧹 [Secret] 敏感信息库为空，已重置候选/输出去重过滤器")
+            except Exception:
+                pass
+
     def scan(self, js_code: str, js_url: str = "", bundle_context: Optional[dict] = None,
              js_file: str = "") -> List[Dict[str, Any]]:
         """扫描单个 JS 文件中的敏感信息。
@@ -390,11 +404,18 @@ class SensitiveInfoScanner:
         js_code = self._preprocess(js_code)
         candidates = self._extract_candidates(js_code)
         # logger.info(f"[SCAN] Extracted {len(candidates)} candidates after math filtering")
-        if not candidates: return []
+        if not candidates:
+            return []
         if self.ast_available:
             candidates = self._enrich_with_ast(candidates, js_code, bundle_context, js_file)
         if len(candidates) > self.max_llm: candidates = self._priority_sort(candidates)[:self.max_llm]
         verified = self._verify_with_llm(candidates)
+        logger.info(f"🔎 [Secret] {js_url}: candidates={len(candidates)} verified={len(verified)}")
+        if candidates and not verified:
+            logger.warning(
+                f"⚠️ [Secret] {js_url} 有 {len(candidates)} 个候选但 LLM 未确认任何密钥"
+                "（LLM 判定非密钥 / 解析失败 / 全部被输出过滤器拦截）"
+            )
         if self.db and js_url and verified is not None: self.db.save_sensitive_info(js_url, verified)
         return verified
 
@@ -503,8 +524,6 @@ class SensitiveInfoScanner:
 def cleanup_bloom_filters():
     _AI_CANDIDATE_DEDUP.close()
     _OUTPUT_LINE_DEDUP.close()
-    _WORD_ANALYSIS_DEDUP.close()
 
 _AI_CANDIDATE_DEDUP = DiskBloomFilter("Result/ai_candidates.bloom", capacity=5_000_000)
 _OUTPUT_LINE_DEDUP = DiskBloomFilter("Result/output_lines.bloom", capacity=5_000_000)
-_WORD_ANALYSIS_DEDUP = DiskBloomFilter("Result/word_analysis.bloom", capacity=10_000_000)

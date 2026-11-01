@@ -27,7 +27,7 @@ Only run it against targets the user explicitly authorizes.
 | --- | --- |
 | Default recommended | `python main.py -u <url> -H 5 -fp -fs` |
 | + sensitive info via AI | add `-asia` |
-| + sensitive info via regex | add `-asir` |
+| + deep API context recall (experimental) | add `-ar` |
 | + request validation (real requests) | add `-rv` |
 | Keep it fast | `-H 2 -t 10` (lower depth / fewer threads) |
 

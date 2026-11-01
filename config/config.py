@@ -1,20 +1,39 @@
 # ===== 此文件由 setup.sh 自动生成，如需自定义请直接编辑此文件 =====
+import os
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_dotenv(path):
+    """读取项目根目录 .env（KEY=VALUE），不覆盖已存在的环境变量。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+
+
+def _abs(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+
 
 # 本地/私有化大模型服务地址
-BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+BASE_URL = os.environ.get("JSCANNER_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 
-# API Key（请替换为您自己的密钥）
-API_KEY = "sk-ws-H.EXLEYXX.cBc8."
+# API Key（优先读环境变量 / .env；真实密钥不要写进仓库）
+API_KEY = os.environ.get("JSCANNER_API_KEY", "")
 
-# 🔧 提示词缓存配置（阿里云 DashScope）
-ENABLE_PROMPT_CACHE = True  # 是否启用提示词缓存
-CACHE_CONTROL_TYPE = "ephemeral"  # 缓存类型：ephemeral（临时缓存，5分钟有效期）
-MIN_CACHE_TOKENS = 1024  # 最小缓存 token 数（约等于字符数）
-MAX_CACHE_MARKERS = 4  # 单次请求最多缓存标记数
+DEFAULT_CONFIG_PATH = _abs("config/models_config.json")  # 模型配置文件路径
 
-DEFAULT_CONFIG_PATH = "config/models_config.json"  # 模型配置文件路径
-
-WHITE_SCOPE_PATH = "config/whiteList.txt"   # 白名单路径（仅扫描指定路径）
+WHITE_SCOPE_PATH = _abs("config/whiteList.txt")   # 白名单路径（仅扫描指定路径）
 MEMORY_LIMIT = 80                            # 内存占用阈值（%），超限时会进行内存释放
 
 proxies = {
@@ -26,16 +45,16 @@ proxies = {
 # ------------------------------
 # 🔔 飞书告警通知
 # ------------------------------
-FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/1412ed79--4e29-adb9-"
+FEISHU_WEBHOOK = os.environ.get("JSCANNER_FEISHU_WEBHOOK", "")
 FEISHU_ALERT_LEVELS = ["ERROR", "CRITICAL"]       # 触发告警的日志级别
 FEISHU_RATE_LIMIT_SECONDS = 60                    # 相同告警内容60秒内只发一次
 
 # ------------------------------
 # 📁 输出路径配置
 # ------------------------------
-db_filename = "Result/JScanner_Result.db"         # 扫描结果数据库路径
-OVERFLOW_DIR = "Overflow_Queue"                   # 溢出队列暂存目录
-LOG_DIR = "logs"                                  # 日志输出目录
+db_filename = _abs("Result/JScanner_Result.db")    # 扫描结果数据库路径
+OVERFLOW_DIR = _abs("Overflow_Queue")              # 溢出队列暂存目录
+LOG_DIR = _abs("logs")                             # 日志输出目录
 
 # ------------------------------
 # 🎯 扫描范围与性能控制

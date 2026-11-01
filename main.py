@@ -1,3 +1,11 @@
+import sys
+
+if sys.version_info < (3, 10):
+    raise SystemExit(
+        f"JScanner2 需要 Python >= 3.10（当前 {sys.version.split()[0]}）；"
+        "请使用 3.10+ 虚拟环境运行，例如 D:/Data/Anaconda3/envs/JScanner2/python.exe"
+    )
+
 import asyncio
 import atexit
 import logging
@@ -25,7 +33,6 @@ from infra.feishu import send_feishu_notify
 from parse_args import parse_args
 from processor.analysis import AISecurityAuditor
 from processor.analysis.api.api_scan import get_root_domain
-from processor.analysis.secret.js_sensitive_rex import find_all_info_by_rex
 from processor.analysis.secret.secret_scanner import SensitiveInfoScanner, cleanup_bloom_filters, remove_html_tags, \
     SQLiteStorage
 from processor.analysis.api.request_executor import batch_execute_requests
@@ -40,12 +47,41 @@ BATCH_SLEEP = 0.2
 API_MIN_LENGTH = 4
 HTML_EXTS = {'.html', '.htm', '.xhtml'}
 
+# R1 缓存复用的轻量目录签名：chunk_dir -> ((文件名, size, mtime_ns), ...)。
+# 只做 stat、不读内容、不算哈希；用于在复用 _INDEX_CACHE 前确认目录没有被改动
+# （新增/删除/改内容/只 touch mtime 都会改变签名）。与索引结构解耦，不污染 files 等键。
+_BUNDLE_DIR_SIG = {}
+
+
+def _bundle_dir_signature(chunk_dir: str):
+    """轻量目录签名：只对 *.js 文件 stat（文件名 + size + mtime_ns）。
+
+    返回排好序的 tuple；目录不可读时返回 None（调用方按"无法确认"处理）。
+    20 个文件的 scandir+stat 比起重建时的 2 次全文读 + 1 次解析便宜两个数量级。
+    """
+    try:
+        entries = []
+        with os.scandir(chunk_dir) as it:
+            for entry in it:
+                if not entry.name.endswith(".js"):
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                entries.append((entry.name, st.st_size, st.st_mtime_ns))
+        entries.sort()
+        return tuple(entries)
+    except OSError:
+        return None
+
 
 def _build_bundle_context(js_url: str, seed_url: str, collect_if_missing: bool = True):
     """为入口 JS 构建跨 chunk 召回上下文；失败/非 webpack 时返回 None（优雅降级）。
 
     策略：
-      1. chunk 缓存目录 = Result/bundle_chunks/<md5(js_url)>，按入口 URL 隔离。
+      1. chunk 缓存目录 = Result/bundle_chunks/<md5(seed_url)>，按站点共享：
+         同一站点的多个 JS 复用同一份 chunk 索引，避免每个 JS 都全量下载一遍。
       2. 目录已存在（含入口 JS）→ 直接构建索引（走缓存，不重新下载）。
       3. 目录不存在 → 若 collect_if_missing 则尝试用 bundle_collector 采集；
          否则（密钥扫描阶段）直接返回 None，避免对 chunk 文件重复采集。
@@ -57,8 +93,9 @@ def _build_bundle_context(js_url: str, seed_url: str, collect_if_missing: bool =
         from processor.js.context.bundle_collector import collect_chunks_sync
 
         import hashlib
+        cache_key = seed_url or js_url or ""
         chunk_dir = os.path.join(
-            "Result", "bundle_chunks", hashlib.md5(js_url.encode()).hexdigest()[:16])
+            "Result", "bundle_chunks", hashlib.md5(cache_key.encode()).hexdigest()[:16])
 
         # 目录已有入口 JS（上次采集过）→ 直接构建索引
         if not (os.path.isdir(chunk_dir) and os.listdir(chunk_dir)):
@@ -68,7 +105,15 @@ def _build_bundle_context(js_url: str, seed_url: str, collect_if_missing: bool =
             # 确保跨 chunk 索引能覆盖它（collect_chunks 默认只采首页入口 JS + webpack chunk）
             collect_chunks_sync(seed_url, chunk_dir, extra_js_urls=[js_url] if js_url else None)
 
+        # 单 JS 路径同款签名阀（R1-2）：与 _build_bundle_contexts_many 用同一套失效判定，
+        # 避免"批量路径有阀、单 JS 路径没阀"的两套取索引方式。目录签名不一致 ⇒ 丢弃进程内
+        # 缓存再取（get_bundle_index 会走磁盘缓存的哈希校验或重建）。签名只在这里算一次。
+        current_sig = _bundle_dir_signature(chunk_dir)
+        if current_sig is not None and _BUNDLE_DIR_SIG.get(chunk_dir) not in (None, current_sig):
+            bi._INDEX_CACHE.pop(chunk_dir, None)
         index = bi.get_bundle_index(chunk_dir)
+        if current_sig is not None:
+            _BUNDLE_DIR_SIG[chunk_dir] = current_sig
         if not index or not index.get("files"):
             return None
         return {
@@ -80,7 +125,8 @@ def _build_bundle_context(js_url: str, seed_url: str, collect_if_missing: bool =
             "resolve_export_name": bi.resolve_export_name,
             "find_secret_callers": bi.find_secret_callers,
         }
-    except Exception:
+    except Exception as e:
+        logger.warning(f"⚠️ [Bundle] 构建跨 chunk 上下文失败（降级为单文件召回）：{e}")
         return None
 
 
@@ -106,9 +152,9 @@ def _assemble_bundle_context(js_url: str, chunk_dir: str, index: dict):
 async def _build_bundle_contexts_many(js_urls, seed_url: str, collect_if_missing: bool = True):
     """并行构建多个 js_url 的跨 chunk 召回上下文。返回 {js_url: context_or_None}。
 
-    方案 B：把串行的"采集 + 建索引"并行化。
-      1. 采集（I/O 密集）：对缺失的 chunk_dir 用原生 collect_chunks 并发下载，
-         在 async 上下文里 asyncio.gather，不阻塞主事件循环。
+    方案 B：同一站点只采集/建索引一次，所有 js_url 复用同一份索引。
+      1. 采集（I/O 密集）：对缺失的 chunk_dir 用原生 collect_chunks 下载，
+         extra_js_urls 覆盖本批独立 JS（UMD 库等），避免每个 JS 重复采集。
       2. 建索引（CPU 密集）：用 ProcessPoolExecutor 并行 build_bundle_index，
          子进程产出纯数据 index，主进程写入 _INDEX_CACHE 并组装 context。
     单个 js_url 失败只影响它自己（返回 None），不影响其他 js_url。
@@ -116,49 +162,86 @@ async def _build_bundle_contexts_many(js_urls, seed_url: str, collect_if_missing
     import hashlib
     from concurrent.futures import ProcessPoolExecutor
     from processor.js.context import bundle_index as bi
-    from processor.js.context.bundle_collector import collect_chunks
+    from processor.js.context.bundle_collector import collect_chunks, append_js_urls
 
-    chunk_dir_map = {}
-    for js_url in js_urls:
-        chunk_dir = os.path.join(
-            "Result", "bundle_chunks", hashlib.md5(js_url.encode()).hexdigest()[:16])
-        chunk_dir_map[js_url] = chunk_dir
+    # 同一站点共享一个 chunk_dir：避免每个 JS 都采集一遍全量 chunk
+    cache_key = seed_url or (js_urls[0] if js_urls else "")
+    shared_dir = os.path.join(
+        "Result", "bundle_chunks", hashlib.md5(cache_key.encode()).hexdigest()[:16])
+    chunk_dir_map = {js_url: shared_dir for js_url in js_urls}
 
-    # 1) 并发采集缺失的 chunk_dir
-    to_collect = [(js_url, cd) for js_url, cd in chunk_dir_map.items()
-                  if not (os.path.isdir(cd) and os.listdir(cd))]
-    if to_collect and collect_if_missing:
-        # 每个 js_url 额外下载其指向的独立 JS 文件（非 webpack chunk，如 UMD 库），
-        # 确保跨 chunk 索引能覆盖它（collect_chunks 默认只采首页入口 JS + webpack chunk）
-        await asyncio.gather(
-            *(collect_chunks(seed_url, cd, extra_js_urls=[js_url] if js_url else None)
-              for js_url, cd in to_collect),
-            return_exceptions=True)
+    # 1) 采集缺失的 chunk_dir（按目录去重，同一站点只采一次）
+    dirs_to_collect = sorted({
+        cd for cd in chunk_dir_map.values()
+        if not (os.path.isdir(cd) and os.listdir(cd))
+    })
+    if dirs_to_collect and collect_if_missing:
+        extra_urls = [u for u in js_urls if u] or None
+        for cd in dirs_to_collect:
+            try:
+                await collect_chunks(seed_url, cd, extra_js_urls=extra_urls)
+            except Exception as e:
+                logger.warning(f"⚠️ [Bundle] chunk 采集失败 {cd}: {e}")
 
-    # 2) 并行建索引（CPU 密集）
-    ready = [js_url for js_url, cd in chunk_dir_map.items()
-             if os.path.isdir(cd) and os.listdir(cd)]
+    # 2) 建索引（CPU 密集），按目录去重。
+    #    R1 修复：已在进程内缓存里的目录直接复用；只有「未缓存」或「本批确实新增了文件」
+    #    的目录才重建。重建仍走 ProcessPoolExecutor，冷启动并行行为保持不变。
+    ready_dirs = sorted({
+        cd for cd in chunk_dir_map.values()
+        if os.path.isdir(cd) and os.listdir(cd)
+    })
+    index_by_dir = {}
+    if ready_dirs:
+        # 共享目录已存在时，补下载本批新出现的 JS，避免索引漏掉后续批次的文件。
+        # 安全阀（两层）：
+        #   1) append_js_urls 返回本次新增文件数（downloaded）；有新增 → 缓存失效重建。
+        #   2) 复用前比对目录签名（文件名 + size + mtime_ns，只 stat 不读内容）：
+        #      覆盖「已有文件内容被改写但不新增」「只 touch mtime」等安全阀 1 覆盖不到的场景。
+        # append 抛异常时无法确认是否写入了新文件，保守处理为未知 → 同样重建。
+        extra_urls = [u for u in js_urls if u] if collect_if_missing else []
+        rebuild_dirs = []
+        for cd in ready_dirs:
+            new_files = 0
+            if collect_if_missing:
+                try:
+                    stats = await append_js_urls(cd, extra_urls)
+                    new_files = int((stats or {}).get("downloaded", 0) or 0)
+                except Exception as e:
+                    logger.warning(f"⚠️ [Bundle] 追加 JS 失败 {cd}: {e}")
+                    new_files = -1  # 未知是否新增 → 强制重建
+            cached_index = bi._INDEX_CACHE.get(cd)
+            if cached_index and cached_index.get("files") and new_files == 0:
+                current_sig = _bundle_dir_signature(cd)
+                if current_sig is not None and current_sig == _BUNDLE_DIR_SIG.get(cd):
+                    # 命中且目录签名未变：直接复用，跳过整目录重读 + 重解析
+                    index_by_dir[cd] = cached_index
+                    continue
+                # 签名缺失或不一致 → 视为失效，重建
+            if cached_index is not None:
+                bi._INDEX_CACHE.pop(cd, None)
+            rebuild_dirs.append(cd)
+        if rebuild_dirs:
+            # 重建前先记一份签名：索引基于「此刻」的目录内容；若重建期间目录又被改动，
+            # 下一批复用前的签名比对会不一致 → 自动重建，不会拿半新半旧的索引。
+            pre_sigs = {cd: _bundle_dir_signature(cd) for cd in rebuild_dirs}
+            workers = min(os.cpu_count() or 1, len(rebuild_dirs))
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                indexes = list(ex.map(bi.build_bundle_index, rebuild_dirs))
+            for cd, index in zip(rebuild_dirs, indexes):
+                if not index or not index.get("files"):
+                    continue
+                bi._INDEX_CACHE[cd] = index  # 进程内缓存，供后续 get_bundle_index 命中
+                sig = pre_sigs.get(cd)
+                if sig is not None:
+                    _BUNDLE_DIR_SIG[cd] = sig  # 记录本次索引对应的目录签名
+                index_by_dir[cd] = index
+
     results = {}
-    if ready:
-        ready_dirs = [chunk_dir_map[js_url] for js_url in ready]
-        workers = min(os.cpu_count() or 1, len(ready))
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            indexes = list(ex.map(bi.build_bundle_index, ready_dirs))
-        for js_url, index in zip(ready, indexes):
-            if not index or not index.get("files"):
-                continue
-            cd = chunk_dir_map[js_url]
-            bi._INDEX_CACHE[cd] = index  # 进程内缓存，供后续 get_bundle_index 命中
+    for js_url, cd in chunk_dir_map.items():
+        index = index_by_dir.get(cd)
+        if index:
             results[js_url] = _assemble_bundle_context(js_url, cd, index)
     return results
-
-
-def _is_more_specific(new_url: str, old_url: str) -> bool:
-    """新 baseURL 的路径前缀比旧的更长，说明更精确"""
-    from urllib.parse import urlparse
-    new_path = urlparse(new_url).path.rstrip('/')
-    old_path = urlparse(old_url).path.rstrip('/')
-    return len(new_path) > len(old_path)
 
 
 def _is_already_base_url(url: str) -> bool:
@@ -168,12 +251,6 @@ def _is_already_base_url(url: str) -> bool:
     parsed = urlparse(url)
     path = parsed.path.rstrip('/')
     return bool(path) and path != '/'
-
-
-def _get_first_level_prefix(api_path):
-    path = api_path.strip().lstrip('/')
-    parts = path.split('/')
-    return parts[0] if parts else ""
 
 
 # 初始化日志
@@ -225,7 +302,6 @@ class Scanner:
         self.initial_urls = []
         self.checker = None
         self.whiteList = read(WHITE_SCOPE_PATH)
-        self.domain_base_urls = {}
 
         # 站点维度 scan_id（P0-1：API 状态按站点隔离）与本次运行 run_id（P0-2：中断恢复）
         self.scan_id = None
@@ -367,9 +443,8 @@ class Scanner:
         base_prefix = effective_seed.rstrip('/') if effective_seed else None
         origin_url = self.args.url
 
-        # 已去除 prefix_agent 前缀验证：API 最终路径（含前缀）由 AI 阶段（reconstruct）
-        # 直接输出，此处不再做前缀聚类判定。verified_clusters 保留为空，默认全量用 base_prefix。
-        verified_clusters = {}
+        # API 最终路径（含前缀）由 AI 阶段（reconstruct）直接输出，此处不做前缀聚类判定。
+        fastscan_qualified = None
 
         qualified_api_paths = set()
         if getattr(self.args, 'fastscan', False) and batch_next_urls:
@@ -390,10 +465,7 @@ class Scanner:
                     if self._is_api_path_blacklisted(api_path):
                         continue
 
-                    cluster = _get_first_level_prefix(api_path)
-                    use_prefix = verified_clusters.get(cluster, True)
-
-                    if use_prefix and base_prefix and _is_already_base_url(base_prefix):
+                    if base_prefix and _is_already_base_url(base_prefix):
                         full_url = f"{base_prefix}/{api_path.lstrip('/')}"
                     else:
                         parsed = urlparse(source_url)
@@ -432,6 +504,7 @@ class Scanner:
                 print(
                     f"🌐 [Quick Scan] {len(urls_to_scan)} URLs → {dup_count} duplicates → {len(qualified_api_paths)} qualified")
                 print(f"🔍 [Filter Stats] Filtered: {filter_count}, Passed: {len(qualified_api_paths)}")
+                fastscan_qualified = set(qualified_api_paths)
         else:
             print("ℹ️  [FastScan] 快速扫描模式未启用，将分析所有 API")
 
@@ -476,6 +549,15 @@ class Scanner:
                     seen_pairs.add(pair)
                     api_pairs.append(pair)
 
+        # fastscan：只保留 quick scan 判定可测的 API（P0-1：过滤结果必须真正生效）
+        if fastscan_qualified is not None:
+            before_filter = len(api_pairs)
+            api_pairs = [(p, j) for p, j in api_pairs if p in fastscan_qualified]
+            print(f"🎯 [FastScan] Quick Scan 过滤：{before_filter} → {len(api_pairs)} 个 API")
+            if not api_pairs:
+                print("⏭️ [FastScan] 本批次没有通过快速扫描的 API，跳过 AI 分析")
+                return
+
         # 去重范围 = (scan_id, api_path)；去重判据 = 状态机
         all_paths_in_batch = list(dict.fromkeys(p for p, _ in api_pairs))
         analyzable_paths = [p for p in all_paths_in_batch if self.checker.should_analyze_api(p)]
@@ -500,10 +582,7 @@ class Scanner:
             if js_url not in js_groups:
                 js_groups[js_url] = []
 
-            cluster = _get_first_level_prefix(api_path)
-            use_prefix = verified_clusters.get(cluster, True)
-
-            if use_prefix and base_prefix and _is_already_base_url(base_prefix):
+            if base_prefix and _is_already_base_url(base_prefix):
                 full_url = f"{base_prefix}/{api_path.lstrip('/')}"
             else:
                 from processor.analysis.api.api_scan import data_clean
@@ -560,6 +639,7 @@ class Scanner:
                     api_paths=api_paths,
                     target_url=effective_seed.strip() if effective_seed else self.args.url.strip(),
                     bundle_context=bundle_context,
+                    agent_recall=getattr(self.args, 'agent_recall', False),
                 )
             except Exception as e:
                 print_exc()
@@ -752,24 +832,8 @@ class Scanner:
         return dynamic_result, static_result
 
     def _get_effective_seed(self) -> str:
-        """获取当前域名已缓存的 baseURL，如果没有则返回原始 seed_url"""
-        if not self.args.url:
-            return self.args.url
-        root_domain = get_root_domain(self.args.url)
-        return self.domain_base_urls.get(root_domain, self.args.url)
-
-    def _collect_base_urls_from_batch(self, scan_info_list):
-        """从本批次的 scan_info 中收集已验证的 baseURL，存入域名级缓存"""
-        root_domain = get_root_domain(self.args.url) if self.args.url else None
-        if not root_domain:
-            return
-        for info in scan_info_list:
-            detected = info.get("detected_base_url")
-            if detected:
-                existing = self.domain_base_urls.get(root_domain)
-                if not existing or _is_more_specific(detected, existing):
-                    self.domain_base_urls[root_domain] = detected
-                    print(f"🎯 [BaseURL] 域名 {root_domain} → {detected}")
+        """返回本次扫描的 seed URL。"""
+        return self.args.url or ""
 
     async def _process_single_batch(self, batch_urls: list, depth: int) -> dict:
         """处理单个批次（提取自 _scan_recursive）"""
@@ -838,11 +902,11 @@ class Scanner:
                 final_children = [u for u in next_urls if self.checker.should_scan(u)]
                 if final_children and rem_height_children >= 0:
                     with open(f"{OVERFLOW_DIR}/overflow_depth_{rem_height_children}_{file_id}_children.txt", "w") as f:
-                        f.write("\n".join(final_children))
+                        f.write("\n".join(final_children) + "\n")
                 rem_height_siblings = self.args.height - depth
                 if remaining_urls and rem_height_siblings >= 0:
                     with open(f"{OVERFLOW_DIR}/overflow_depth_{rem_height_siblings}_{file_id}_siblings.txt", "w") as f:
-                        f.write("\n".join([u for u in remaining_urls if ".js" in u]))
+                        f.write("\n".join([u for u in remaining_urls if ".js" in u]) + "\n")
                 self.db_handler.close()
                 print(f"🛑 进程主动退出 (Memory Safety)")
                 return False
@@ -896,8 +960,6 @@ class Scanner:
 
                 all_scan_info_list.extend(batch_result["scan_info_list"])
 
-                self._collect_base_urls_from_batch(batch_result["scan_info_list"])
-
                 for n_url in batch_result["next_urls"]:
                     if self.checker.should_scan(n_url):
                         all_next_urls.add(n_url)
@@ -930,8 +992,8 @@ class Scanner:
             if not self._check_memory_and_handle(depth, all_next_urls, remaining):
                 return
 
-        if self.args.analyzeSensitiveInfoRex or self.args.analyzeSensitiveInfoAI:
-            print(f"🔍 正在提取敏感信息 (Regex/Qwen)...")
+        if self.args.analyzeSensitiveInfoAI:
+            print(f"🔍 正在提取敏感信息 (Qwen)...")
             await self._extract_sensitive_info(all_scan_info_list)
 
         if all_next_urls:
@@ -957,7 +1019,6 @@ class Scanner:
             if has_source_map == "Y":
                 print(f"🗺️ [SourceMap] 发现 SourceMap 暴露：{url}")
 
-            combined_sensitive_info = set()
             if self.args.analyzeSensitiveInfoAI and self.sensitive_scanner:
                 try:
                     # 跨 chunk 密钥召回：复用 API 阶段已采集的 chunk 缓存（不重新采集）
@@ -971,8 +1032,6 @@ class Scanner:
                         js_code=scan_info["source_code"], js_url=url,
                         bundle_context=bundle_context, js_file=js_file)
                     if ai_results:
-                        for item in ai_results:
-                            combined_sensitive_info.add(item.get("value", ""))
                         high_risk = [r for r in ai_results if r.get("risk_level") == "High"]
                         if high_risk:
                             print(f"🔥 [High Risk] URL: {url}")
@@ -986,13 +1045,6 @@ class Scanner:
                     print_exc()
                     logger.error(f"❌ [AI Scan] 分析失败 {url}: {e}")
                     print(f"❌ [AI Scan] 分析失败 {url}: {e}")
-            if self.args.analyzeSensitiveInfoRex:
-                try:
-                    rex_results = find_all_info_by_rex(scan_info["source_code"])
-                    if rex_results:
-                        combined_sensitive_info.update(rex_results)
-                except Exception:
-                    pass
 
         if source_map_results:
             self.db_handler.batch_save_source_map_results(source_map_results)
@@ -1002,6 +1054,7 @@ class Scanner:
 
 
 if __name__ == '__main__':
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
     init(autoreset=True)
     args = parse_args()
     start_time = time.time()

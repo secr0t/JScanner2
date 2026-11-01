@@ -57,6 +57,15 @@ class DiskBloomFilter:
                 return False
         return True
 
+    def clear(self):
+        """清空过滤器（用于与 DB 生命周期对齐，避免旧去重记录压掉新库结果）"""
+        try:
+            self.mm.seek(0)
+            self.mm.write(b'\x00' * self.byte_size)
+            self.mm.flush()
+        except Exception:
+            pass
+
     def close(self):
         """关闭文件句柄，数据已自动持久化到磁盘"""
         try:

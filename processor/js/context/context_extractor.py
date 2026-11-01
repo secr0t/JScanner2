@@ -7,7 +7,6 @@ from processor.js.context.param_scoring import get_param_score
 
 # 上下文大小限制常量
 MAX_CONTEXT_BYTES = 5000  # 约5KB
-MAX_CONTEXT_TOKENS_ESTIMATE = 1500
 _MAX_OBJECT_BYTES = 50000
 
 _FUNCTION_TYPES = {
@@ -989,10 +988,21 @@ def _bridge_callers(bridge_index, code_bytes: bytes, wrapper_name: str,
         return None
     src = bridge_index["src"]
 
+    # 索引里的模块边界/导出偏移都是 str 的字符偏移，而 wrapper_byte 是 tree-sitter
+    # 的 bytes 偏移；含非 ASCII（中文文案等）时两者不相等，必须先换算，
+    # 否则模块定位会错位甚至直接失败（CJK bundle 的桥接就是在这里断掉的）。
+    wrapper_char = wrapper_byte
+    if wrapper_byte is not None:
+        try:
+            wrapper_char = len(code_bytes[:max(0, wrapper_byte)]
+                                .decode("utf-8", errors="replace"))
+        except Exception:
+            wrapper_char = wrapper_byte
+
     # 1) 定位 wrapper 所在 webpack 模块
     mstart = mend = None
     for off, end, ln in bridge_index["ranges"]:
-        if off <= wrapper_byte < end:
+        if off <= wrapper_char < end:
             mstart, mend = off, end
             break
     if mstart is None:
@@ -1048,7 +1058,8 @@ def _bridge_callers(bridge_index, code_bytes: bytes, wrapper_name: str,
 
 def _extract_multiple_apis_from_bytes(code_bytes: bytes, target_apis: list,
                                       trace: Optional[list] = None,
-                                      bundle_context: Optional[dict] = None
+                                      bundle_context: Optional[dict] = None,
+                                      agent_recall: bool = False
                                       ) -> Dict[str, Dict[str, Any]]:
     _PARSER = get_parser()
     logger = get_logger()
@@ -1097,10 +1108,15 @@ def _extract_multiple_apis_from_bytes(code_bytes: bytes, target_apis: list,
         if node.type == 'string':
             # 直接在 bytes 层面做包含判断，极速！
             raw_bytes = code_bytes[node.start_byte:node.end_byte]
+            # 同一字符串可能包含多个目标 API（如 "/api/user" 与 "/api/user/list"）：
+            # 取最长的那个，避免短路径抢占长路径的命中，造成归属错位。
+            best = None
             for i, api_bytes in enumerate(target_apis_bytes):
                 if api_bytes in raw_bytes:
-                    hit_nodes.append((target_apis[i], node))
-                    break  # 一个节点匹配上就行了
+                    if best is None or len(target_apis_bytes[i]) > len(target_apis_bytes[best]):
+                        best = i
+            if best is not None:
+                hit_nodes.append((target_apis[best], node))
 
         # 任务 B: 收集所有的函数调用 (为后面找 Caller 做铺垫)
         elif node.type == 'call_expression':
@@ -1268,6 +1284,14 @@ def _extract_multiple_apis_from_bytes(code_bytes: bytes, target_apis: list,
     if bundle_context and isinstance(bundle_context, dict):
         _cross_chunk_fallback(results, target_apis, bundle_context, trace)
 
+    # ---- Agent 召回：普通/跨chunk召回仍不足时，用 LLM 工具循环深度召回补充 ----
+    if agent_recall:
+        # code_bytes 是本文件的字节源；RecallAgent 需要 str（按行号检索的文本视图）。
+        _agent_recall_fallback(
+            results, target_apis,
+            code_bytes.decode('utf-8', errors='replace'),
+            bundle_context, trace)
+
     return results
 
 
@@ -1302,9 +1326,17 @@ def _cross_chunk_fallback(results, target_apis, bundle_context, trace):
 
             # 1) 优先：用 find_api_callers 召回调用方参数（需导出名）
             if find_callers and resolve_export:
-                export_name = resolve_export(chunk_dir, index, api)
+                try:
+                    resolved = resolve_export(chunk_dir, index, api, with_module=True)
+                except TypeError:
+                    resolved = resolve_export(chunk_dir, index, api)
+                if isinstance(resolved, tuple):
+                    export_name, def_module_id = resolved
+                else:
+                    export_name, def_module_id = resolved, None
                 if export_name:
-                    cr = find_callers(chunk_dir, index, export_name)
+                    cr = find_callers(chunk_dir, index, export_name,
+                                      def_module_id=def_module_id)
                     if cr and cr.get("callers"):
                         rd["caller_codes"] = [c["code"] for c in cr["callers"]]
                         rd["caller_params"] = _merge_caller_params(cr["callers"])
@@ -1338,9 +1370,68 @@ def _cross_chunk_fallback(results, target_apis, bundle_context, trace):
         logger.error(f"[-] cross_chunk_fallback error: {e}")
 
 
+def _agent_recall_fallback(results, target_apis, js_code, bundle_context, trace):
+    """对普通/跨chunk召回仍不足的 API，用 LLM 工具循环（RecallAgent）深度召回补充。
+
+    仅在 caller_codes 为空时触发（LLM 密集，成本高）。复用 bundle_context 让
+    agent 具备跨 chunk 检索能力。失败/异常不影响主流程（优雅降级）。
+    """
+    AGENT_MAX_STEPS = 12  # 单 API 最大决策步数（写死，兼顾召回质量与成本）
+    try:
+        from .agent_recall_bridge import build_recall_client, load_recall_agent
+        RecallAgent = load_recall_agent()
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"[-] agent_recall_fallback import error: {e}")
+        return
+
+    # 只对仍缺调用方的 API 做 agent 召回
+    pending = [api for api in target_apis
+               if results.get(api) and not results.get(api, {}).get("caller_codes")]
+    if not pending:
+        return
+
+    try:
+        agent = RecallAgent(js_code, model_client=build_recall_client(),
+                            max_steps=AGENT_MAX_STEPS,
+                            bundle_context=bundle_context)
+    except Exception as e:
+        logger = get_logger()
+        logger.error(f"[-] agent_recall init error: {e}")
+        return
+
+    logger = get_logger()
+    for api in pending:
+        try:
+            rep = agent.deep_recall(api)
+            rd = results.get(api)
+            if not rd:
+                continue
+            result = rep.get("result") or {}
+            caller_codes = result.get("caller_codes") or []
+            wrapper_code = result.get("wrapper_code") or ""
+            if caller_codes:
+                rd["caller_codes"] = caller_codes
+                rd["agent_recall"] = True
+            if wrapper_code and not rd.get("wrapper_code"):
+                rd["wrapper_code"] = wrapper_code
+            if rep.get("summary"):
+                rd["agent_summary"] = rep["summary"]
+            if trace is not None:
+                trace.append({
+                    "stage": "agent_recall",
+                    "api": api,
+                    "found": bool(caller_codes),
+                    "steps": len(rep.get("tool_trace") or []),
+                })
+        except Exception as e:
+            logger.error(f"[-] agent_recall error for {api}: {e}")
+
+
 def extract_multiple_apis_from_raw_code(js_code: str, target_apis: list,
                                         trace: Optional[list] = None,
-                                        bundle_context: Optional[dict] = None
+                                        bundle_context: Optional[dict] = None,
+                                        agent_recall: bool = False
                                         ) -> Dict[str, Dict[str, Any]]:
     """提取多个 API 的上下文。
 
@@ -1351,10 +1442,13 @@ def extract_multiple_apis_from_raw_code(js_code: str, target_apis: list,
     调用方参数（需 resolve_export_name 提供 api_path->导出名映射），否则退回
     cross_chunk_recall 召回定义片段。
     None 时走原逻辑（向后兼容）。
+
+    agent_recall（可选）：为 True 时，普通/跨chunk召回仍不足的 API 会用
+    LLM 工具循环（RecallAgent）深度召回补充上下文（LLM 密集，默认关闭）。
     """
     if not isinstance(js_code, str) or not isinstance(target_apis, list):
         return {}
     return _extract_multiple_apis_from_bytes(
         js_code.encode('utf-8', errors='replace'), target_apis, trace,
-        bundle_context)
+        bundle_context, agent_recall)
 

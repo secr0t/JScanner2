@@ -46,8 +46,8 @@ class ScanOptions:
     findparam: bool = True          # 默认开启 API 参数解析（对齐 run_scan.sh 的 BASE_PYTHON_ARGS）
     fastscan: bool = True           # 快速扫描模式
     analyze_sensitive_info_ai: bool = False   # AI 敏感信息分析（省 token，默认关）
-    analyze_sensitive_info_rex: bool = False  # 正则敏感信息分析
     request_validation: bool = False           # 请求验证
+    agent_recall: bool = False                 # LLM 工具循环深度召回（实验特性，依赖 test/template_recall）
     proxy: Optional[str] = None
     visible: bool = False                      # 浏览器可见模式
     use_shared_db: bool = False                # True=使用全局共享 DB（保留跨次去重）
@@ -62,8 +62,8 @@ class ScanOptions:
 
         Scanner.__init__ / Scanner.run 访问的 args 属性：
         url, height, thread_num, proxy, visible,
-        findparam, fastscan, analyzeSensitiveInfoAI, analyzeSensitiveInfoRex,
-        request_validation, no_request, initial_urls
+        findparam, fastscan, analyzeSensitiveInfoAI,
+        request_validation, initial_urls
         """
         from argparse import Namespace
 
@@ -76,9 +76,8 @@ class ScanOptions:
             findparam=self.findparam,
             fastscan=self.fastscan,
             analyzeSensitiveInfoAI=self.analyze_sensitive_info_ai,
-            analyzeSensitiveInfoRex=self.analyze_sensitive_info_rex,
             request_validation=self.request_validation,
-            no_request=not self.request_validation,   # 语义取反
+            agent_recall=self.agent_recall,
             initial_urls=[],                           # run() 中会覆盖
         )
 
@@ -138,8 +137,8 @@ class TaskInfo:
                 "findparam": self.options.findparam,
                 "fastscan": self.options.fastscan,
                 "analyze_sensitive_info_ai": self.options.analyze_sensitive_info_ai,
-                "analyze_sensitive_info_rex": self.options.analyze_sensitive_info_rex,
                 "request_validation": self.options.request_validation,
+                "agent_recall": self.options.agent_recall,
                 "proxy": self.options.proxy,
                 "use_shared_db": self.options.use_shared_db,
             },

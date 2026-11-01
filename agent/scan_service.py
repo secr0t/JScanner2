@@ -51,6 +51,12 @@ async def run_scan_async(task: TaskInfo) -> TaskInfo:
     db_path = _resolve_db_path(task.task_id, options.use_shared_db)
     task.result_db_path = db_path
 
+    # 排队期间被 stop_task 标记取消：直接收尾，不构造 Scanner/DB
+    if task.status == TaskStatus.CANCELLED:
+        task.phase = "cancelled"
+        task.finished_at = time.time()
+        return task
+
     # 确保目录存在
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
 
@@ -62,6 +68,7 @@ async def run_scan_async(task: TaskInfo) -> TaskInfo:
 
     task.status = TaskStatus.RUNNING
     task.started_at = time.time()
+    task.phase = "startup"
 
     try:
         await scanner.run()

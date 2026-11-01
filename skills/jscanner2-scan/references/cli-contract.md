@@ -18,16 +18,15 @@ Docker entry: `docker compose run --rm scanner /app/run_scan.sh urls.txt`.
 | Flag | Type / default | Purpose |
 | --- | --- | --- |
 | `-u, --url` | str, required | Target site URL (must include http/https) |
-| `-H, --height` | int, default 2 | Recursive scan depth |
+| `-H, --depth` (`--height`) | int, default 2 | Recursive scan depth |
 | `-t, --thread_num` | int, default 10 | Concurrent threads |
 | `-p, --proxy` | str | Proxy, e.g. `http://127.0.0.1:7890` |
 | `-v, --visible` | flag | Show the browser window (default headless) |
 | `-fp, --findparam` | flag | Auto-parse API parameters (recommended) |
 | `-fs, --fastscan` | flag | Fast-scan: HTTP-probe filter before AI analysis (recommended) |
-| `-asir, --analyzeSensitiveInfoRex` | flag | Collect sensitive info from JS via regex |
 | `-asia, --analyzeSensitiveInfoAI` | flag | Analyze sensitive info with AI |
 | `-rv, --request-validation` | flag | Auto-send validation requests after AI analysis |
-| `-nr, --no-request` | flag | Store AI results only, skip validation requests |
+| `-ar, --agent-recall` | flag | LLM tool-loop deep recall for missing API context (experimental, high token cost) |
 
 Recommended combo (matches `run_scan.sh` defaults): `-H 5 -fp -fs -asia`.
 
