@@ -106,6 +106,14 @@ python main.py -u https://target.com -H 5 -fp -fs -asia
 
 ---
 
+## 🔐 密钥识别算法
+
+JScanner2 的 AI 密钥识别链路采用基于**熵与分词特征的候选评分方法**，并结合 AST 上下文分析与大语言模型复核，对 JavaScript 源码中的潜在密钥进行识别与风险判定。
+
+相关算法思路与技术细节见：[先知社区技术文章](https://xz.aliyun.com/news/91962)。本项目在密钥识别流程中使用了该公开技术方案。
+
+---
+
 ## 💡 为什么选择JScanner2
 
 ###  传统工具的局限性
